@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SMS Gateway</string>
+    <string name="notification_channel_name">SMS Gateway Service</string>
+    <string name="notification_title">SMS Gateway Active</string>
+    <string name="notification_text">Polling for messages…</string>
+    <string name="permission_internet">Required to connect to the Gateway Server over HTTPS.</string>
+    <string name="permission_send_sms">Required to send SMS messages through your SIM.</string>
+    <string name="permission_phone_state">Required to detect SIM status and select subscription on dual-SIM devices.</string>
+    <string name="permission_notifications">Required to show the foreground service notification while the gateway is running.</string>
+    <string name="permission_boot">Required to restart the gateway service after device reboot.</string>
+</resources>

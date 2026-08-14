@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: Apache-2.0
+import { beforeAll, afterAll, beforeEach, describe, it, expect } from "vitest";
+import pg from "pg";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { drizzle } from "drizzle-orm/node-postgres";
+import * as schema from "../src/db/schema.js";
+import { createApp } from "../src/index.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+process.env.ADMIN_SECRET = "test-admin-secret";
+process.env.CRON_SECRET = "test-cron-secret";
+process.env.API_RATE_LIMIT_PER_MIN = "1000";
+process.env.MESSAGE_TTL_SECONDS = "300";
+process.env.JOB_CLAIM_TTL_SECONDS = "120";
+process.env.HEARTBEAT_TTL_SECONDS = "90";
+
+const TEST_DB_URL =
+  process.env.TEST_DATABASE_URL ??
+  "postgresql://smsgateway:smsgateway@localhost:5432/smsgateway_test";
+
+let pool: pg.Pool;
+let app: ReturnType<typeof createApp>;
+
+async function resetDb() {
+  await pool.query(`
+    TRUNCATE TABLE rate_limit_buckets, message_events, messages, gateways, registration_tokens, api_clients CASCADE
+  `);
+}
+
+async function seedClient(): Promise<{ apiKey: string; clientId: string }> {
+  const res = await app.request("/api/v1/admin/clients", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer test-admin-secret",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ name: "test-client" }),
+  });
+  const data = await res.json();
+  return { apiKey: data.apiKey, clientId: data.id };
+}
+
+async function seedRegistrationToken(): Promise<string> {
+  const res = await app.request("/api/v1/admin/registration-tokens", {
+    method: "POST",
+    headers: { Authorization: "Bearer test-admin-secret" },
+  });
+  const data = await res.json();
+  return data.token;
+}
+
+async function registerGateway(token: string, name = "test-phone"): Promise<{ gatewayId: string; secret: string }> {
+  const res = await app.request("/api/v1/gateways/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, name }),
+  });
+  expect(res.status).toBe(201);
+  return res.json();
+}
+
+function gatewayAuth(gatewayId: string, secret: string) {
+  return `Gateway ${gatewayId}:${secret}`;
+}
+
+beforeAll(async () => {
+  process.env.DATABASE_URL = TEST_DB_URL;
+  pool = new pg.Pool({ connectionString: TEST_DB_URL });
+  const db = drizzle(pool, { schema });
+  const migrationsFolder = path.join(__dirname, "../drizzle");
+  await migrate(db, { migrationsFolder });
+  app = createApp();
+});
+
+afterAll(async () => {
+  await pool.end();
+});
+
+beforeEach(async () => {
+  await resetDb();
+});
+
+describe("Authentication", () => {
+  it("rejects missing API key", async () => {
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: "+12025550100", message: "hi" }),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects invalid API key", async () => {
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer invalid-key",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "hi" }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("Message creation", () => {
+  it("queues a valid message", async () => {
+    const { apiKey } = await seedClient();
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Hello" }),
+    });
+    expect(res.status).toBe(202);
+    const data = await res.json();
+    expect(data.status).toBe("QUEUED");
+    expect(data.id).toBeDefined();
+  });
+
+  it("rejects invalid phone number", async () => {
+    const { apiKey } = await seedClient();
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "not-a-phone", message: "Hello" }),
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error.code).toBe("INVALID_PHONE");
+  });
+
+  it("rejects empty message", async () => {
+    const { apiKey } = await seedClient();
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "   " }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns same message for idempotent request", async () => {
+    const { apiKey } = await seedClient();
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "idem-123",
+    };
+    const body = JSON.stringify({ to: "+12025550100", message: "OTP 123456" });
+
+    const res1 = await app.request("/api/v1/messages", { method: "POST", headers, body });
+    const res2 = await app.request("/api/v1/messages", { method: "POST", headers, body });
+
+    const data1 = await res1.json();
+    const data2 = await res2.json();
+    expect(data1.id).toBe(data2.id);
+  });
+});
+
+describe("Gateway registration", () => {
+  it("registers gateway with valid token", async () => {
+    await seedClient();
+    const token = await seedRegistrationToken();
+    const result = await registerGateway(token);
+    expect(result.gatewayId).toBeDefined();
+    expect(result.secret).toBeDefined();
+  });
+
+  it("rejects reused registration token", async () => {
+    await seedClient();
+    const token = await seedRegistrationToken();
+    await registerGateway(token);
+    const res = await app.request("/api/v1/gateways/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, name: "another" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects revoked gateway", async () => {
+    await seedClient();
+    const token = await seedRegistrationToken();
+    const { gatewayId, secret } = await registerGateway(token);
+
+    await app.request(`/api/v1/admin/gateways/${gatewayId}/revoke`, {
+      method: "POST",
+      headers: { Authorization: "Bearer test-admin-secret" },
+    });
+
+    const res = await app.request("/api/v1/gateways/heartbeat", {
+      method: "POST",
+      headers: {
+        Authorization: gatewayAuth(gatewayId, secret),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ appVersion: "1.0.0" }),
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("Job delivery flow", () => {
+  async function setupOnlineGateway() {
+    await seedClient();
+    const token = await seedRegistrationToken();
+    const gw = await registerGateway(token);
+    await app.request("/api/v1/gateways/heartbeat", {
+      method: "POST",
+      headers: {
+        Authorization: gatewayAuth(gw.gatewayId, gw.secret),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ appVersion: "1.0.0", paused: false }),
+    });
+    return gw;
+  }
+
+  it("assigns and delivers message through gateway", async () => {
+    const { apiKey } = await seedClient();
+    const gw = await setupOnlineGateway();
+
+    const msgRes = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Test SMS" }),
+    });
+    const msg = await msgRes.json();
+
+    const jobsRes = await app.request("/api/v1/gateways/jobs", {
+      headers: { Authorization: gatewayAuth(gw.gatewayId, gw.secret) },
+    });
+    const jobs = await jobsRes.json();
+    expect(jobs.jobs.length).toBeGreaterThan(0);
+
+    const jobId = jobs.jobs[0].id;
+    await app.request(`/api/v1/gateways/jobs/${jobId}/ack`, {
+      method: "POST",
+      headers: { Authorization: gatewayAuth(gw.gatewayId, gw.secret) },
+    });
+
+    const resultRes = await app.request(`/api/v1/gateways/jobs/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        Authorization: gatewayAuth(gw.gatewayId, gw.secret),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ success: true }),
+    });
+    expect(resultRes.status).toBe(200);
+
+    const statusRes = await app.request(`/api/v1/messages/${msg.id}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const status = await statusRes.json();
+    expect(status.status).toBe("SENT");
+  });
+
+  it("reports failed delivery", async () => {
+    const { apiKey } = await seedClient();
+    const gw = await setupOnlineGateway();
+
+    await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Fail test" }),
+    });
+
+    const jobsRes = await app.request("/api/v1/gateways/jobs", {
+      headers: { Authorization: gatewayAuth(gw.gatewayId, gw.secret) },
+    });
+    const { jobs } = await jobsRes.json();
+    const jobId = jobs[0].id;
+
+    await app.request(`/api/v1/gateways/jobs/${jobId}/ack`, {
+      method: "POST",
+      headers: { Authorization: gatewayAuth(gw.gatewayId, gw.secret) },
+    });
+
+    await app.request(`/api/v1/gateways/jobs/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        Authorization: gatewayAuth(gw.gatewayId, gw.secret),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ success: false, errorCode: "SMS_FAILED", errorMessage: "No SIM" }),
+    });
+
+    const statusRes = await app.request(`/api/v1/messages/${jobs[0].id}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const status = await statusRes.json();
+    expect(status.status).toBe("FAILED");
+    expect(status.errorCode).toBe("SMS_FAILED");
+  });
+
+  it("keeps message queued when gateway offline", async () => {
+    const { apiKey } = await seedClient();
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Queued" }),
+    });
+    const data = await res.json();
+    expect(data.status).toBe("QUEUED");
+  });
+});
+
+describe("Expired messages", () => {
+  it("expires old queued messages via maintenance", async () => {
+    const { apiKey } = await seedClient();
+    process.env.MESSAGE_TTL_SECONDS = "0";
+
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Expire me" }),
+    });
+    const msg = await res.json();
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    await app.request("/api/v1/maintenance", {
+      method: "POST",
+      headers: { Authorization: "Bearer test-cron-secret" },
+    });
+
+    const statusRes = await app.request(`/api/v1/messages/${msg.id}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const status = await statusRes.json();
+    expect(status.status).toBe("EXPIRED");
+
+    process.env.MESSAGE_TTL_SECONDS = "300";
+  });
+});
+
+describe("Rate limiting", () => {
+  it("returns 429 when rate limit exceeded", async () => {
+    process.env.API_RATE_LIMIT_PER_MIN = "2";
+    const { apiKey } = await seedClient();
+
+    for (let i = 0; i < 2; i++) {
+      await app.request("/api/v1/messages", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ to: "+12025550100", message: `msg ${i}` }),
+      });
+    }
+
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "over limit" }),
+    });
+    expect(res.status).toBe(429);
+
+    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+  });
+});
+
+describe("Health check", () => {
+  it("returns ok status", async () => {
+    const res = await app.request("/api/v1/health");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.status).toBe("ok");
+  });
+});

@@ -1,0 +1,19 @@
+{
+  "name": "sms-gateway-example-client",
+  "version": "1.0.0",
+  "description": "Example external client for SMS Gateway",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "send": "tsx index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.5.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "@types/node": "^22.15.21"
+  }
+}

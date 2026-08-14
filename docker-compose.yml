@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: smsgateway
+      POSTGRES_PASSWORD: smsgateway
+      POSTGRES_DB: smsgateway
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smsgateway -d smsgateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://smsgateway:smsgateway@postgres:5432/smsgateway
+      ADMIN_SECRET: ${ADMIN_SECRET:-change-me-admin-secret}
+      CRON_SECRET: ${CRON_SECRET:-change-me-cron-secret}
+      API_RATE_LIMIT_PER_MIN: ${API_RATE_LIMIT_PER_MIN:-60}
+      MESSAGE_TTL_SECONDS: ${MESSAGE_TTL_SECONDS:-300}
+      JOB_CLAIM_TTL_SECONDS: ${JOB_CLAIM_TTL_SECONDS:-120}
+      HEARTBEAT_TTL_SECONDS: ${HEARTBEAT_TTL_SECONDS:-90}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV: production
+      PORT: 3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
