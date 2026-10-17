@@ -687,35 +687,24 @@ export async function checkRateLimit(
 ): Promise<boolean> {
   const now = new Date();
   const windowStart = new Date(Math.floor(now.getTime() / 60000) * 60000);
-
   const [bucket] = await db
-    .select()
-    .from(rateLimitBuckets)
-    .where(
-      and(
-        eq(rateLimitBuckets.bucketKey, bucketKey),
-        eq(rateLimitBuckets.windowStart, windowStart)
-      )
-    )
-    .limit(1);
-
-  if (!bucket) {
-    await db.insert(rateLimitBuckets).values({
+    .insert(rateLimitBuckets)
+    .values({
       bucketKey,
       windowStart,
       requestCount: 1,
-    });
-    return true;
-  }
+    })
+    .onConflictDoUpdate({
+      target: [rateLimitBuckets.bucketKey, rateLimitBuckets.windowStart],
+      set: {
+        requestCount: sql`CASE
+          WHEN ${rateLimitBuckets.requestCount} < ${limit}
+            THEN ${rateLimitBuckets.requestCount} + 1
+          ELSE ${rateLimitBuckets.requestCount}
+        END`,
+      },
+    })
+    .returning({ requestCount: rateLimitBuckets.requestCount });
 
-  if (bucket.requestCount >= limit) {
-    return false;
-  }
-
-  await db
-    .update(rateLimitBuckets)
-    .set({ requestCount: bucket.requestCount + 1 })
-    .where(eq(rateLimitBuckets.id, bucket.id));
-
-  return true;
+  return (bucket?.requestCount ?? 0) <= limit;
 }

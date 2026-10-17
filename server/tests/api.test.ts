@@ -731,30 +731,60 @@ describe("Expired messages", () => {
 });
 
 describe("Rate limiting", () => {
-  it("returns 429 when rate limit exceeded", async () => {
-    process.env.API_RATE_LIMIT_PER_MIN = "2";
-    const { apiKey } = await seedClient();
-
-    for (let i = 0; i < 2; i++) {
-      await app.request("/api/v1/messages", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ to: "+12025550100", message: `msg ${i}` }),
-      });
-    }
-
-    const res = await app.request("/api/v1/messages", {
+  function messageRequest(apiKey: string, message: string) {
+    return app.request("/api/v1/messages", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ to: "+12025550100", message: "over limit" }),
+      body: JSON.stringify({ to: "+12025550100", message }),
     });
+  }
+
+  it("returns 429 when rate limit exceeded", async () => {
+    process.env.API_RATE_LIMIT_PER_MIN = "2";
+    const { apiKey } = await seedClient();
+
+    for (let i = 0; i < 2; i++) {
+      const response = await messageRequest(apiKey, `msg ${i}`);
+      expect(response.status).not.toBe(429);
+    }
+
+    const res = await messageRequest(apiKey, "over limit");
     expect(res.status).toBe(429);
+
+    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+  });
+
+  it("enforces the limit without lost increments under concurrent requests", async () => {
+    process.env.API_RATE_LIMIT_PER_MIN = "2";
+    const { apiKey } = await seedClient();
+
+    const responses = await Promise.all(
+      Array.from({ length: 12 }, (_, index) => messageRequest(apiKey, `concurrent ${index}`))
+    );
+
+    expect(responses.filter((response) => response.status !== 429)).toHaveLength(2);
+    expect(responses.filter((response) => response.status === 429)).toHaveLength(10);
+
+    const buckets = await pool.query(
+      "SELECT request_count FROM rate_limit_buckets WHERE bucket_key = $1",
+      [`client:${apiKey.slice(0, 16)}`]
+    );
+    expect(buckets.rows[0].request_count).toBe(2);
+
+    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+  });
+
+  it("keeps rate-limit buckets isolated between clients", async () => {
+    process.env.API_RATE_LIMIT_PER_MIN = "1";
+    const first = await seedClient();
+    const second = await seedClient();
+
+    expect((await messageRequest(first.apiKey, "first")).status).not.toBe(429);
+    expect((await messageRequest(first.apiKey, "first over")).status).toBe(429);
+    expect((await messageRequest(second.apiKey, "second")).status).not.toBe(429);
 
     process.env.API_RATE_LIMIT_PER_MIN = "1000";
   });
