@@ -17,7 +17,18 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("boolean", "USE_FAKE_SMS", "false")
+    }
+
+    flavorDimensions += "mode"
+    productFlavors {
+        create("dev") {
+            dimension = "mode"
+            buildConfigField("boolean", "USE_FAKE_SMS", "true")
+        }
+        create("prod") {
+            dimension = "mode"
+            buildConfigField("boolean", "USE_FAKE_SMS", "false")
+        }
     }
 
     buildTypes {
@@ -28,6 +39,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
         debug {
             isMinifyEnabled = false

@@ -24,6 +24,8 @@ import {
 import { normalizePhoneNumber, PhoneValidationError } from "../lib/phone.js";
 import { AppError } from "../lib/errors.js";
 
+type DatabaseTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+
 export async function createApiClient(db: Database, name: string) {
   const apiKey = generateApiKey();
   const apiKeyHash = await hashSecret(apiKey);
@@ -133,7 +135,7 @@ export async function revokeGateway(db: Database, gatewayId: string): Promise<vo
 }
 
 async function recordEvent(
-  db: Database,
+  db: Database | DatabaseTransaction,
   messageId: string,
   fromStatus: Message["status"] | null,
   toStatus: Message["status"],
@@ -163,9 +165,7 @@ export async function createMessage(
 
   let normalizedTo: string;
   try {
-    console.log("INPUT TO:", to);
     normalizedTo = normalizePhoneNumber(to);
-    console.log("NORMALIZED TO:", normalizedTo);
   } catch (err) {
     if (err instanceof PhoneValidationError) {
       throw new AppError("INVALID_PHONE", err.message);
@@ -173,34 +173,56 @@ export async function createMessage(
     throw err;
   }
 
-  if (idempotencyKey) {
-    console.log("IDEMPOTENCY CHECK: key =", idempotencyKey);
-    const [existing] = await db
+  const expiresAt = new Date(Date.now() + config.messageTtlSeconds * 1000);
+  const message = await db.transaction(async (tx) => {
+    const inserted = await tx
+      .insert(messages)
+      .values({
+        clientId,
+        to: normalizedTo,
+        body,
+        idempotencyKey: idempotencyKey ?? null,
+        expiresAt,
+      })
+      .onConflictDoNothing({
+        target: [messages.clientId, messages.idempotencyKey],
+      })
+      .returning();
+
+    if (inserted[0]) {
+      await recordEvent(tx, inserted[0].id, null, "QUEUED");
+      return inserted[0];
+    }
+
+    const [existing] = await tx
       .select()
       .from(messages)
-      .where(and(eq(messages.clientId, clientId), eq(messages.idempotencyKey, idempotencyKey)))
+      .where(
+        and(
+          eq(messages.clientId, clientId),
+          eq(messages.idempotencyKey, idempotencyKey!)
+        )
+      )
       .limit(1);
-    if (existing) {
-      console.log("IDEMPOTENCY HIT: returning cached message", existing.id, "to:", existing.to);
-      return existing;
+
+    if (!existing) {
+      throw new AppError(
+        "IDEMPOTENCY_CONFLICT",
+        "The message could not be resolved after an idempotency conflict",
+        409
+      );
     }
-  }
 
-  const expiresAt = new Date(Date.now() + config.messageTtlSeconds * 1000);
-  console.log("INSERTING TO:", normalizedTo);
-  const [message] = await db
-    .insert(messages)
-    .values({
-      clientId,
-      to: normalizedTo,
-      body,
-      idempotencyKey: idempotencyKey ?? null,
-      expiresAt,
-    })
-    .returning();
+    if (existing.to !== normalizedTo || existing.body !== body) {
+      throw new AppError(
+        "IDEMPOTENCY_KEY_REUSED",
+        "The idempotency key was already used with a different message",
+        409
+      );
+    }
 
-  console.log("DB RETURNED MESSAGE:", message);
-  await recordEvent(db, message.id, null, "QUEUED");
+    return existing;
+  });
 
   const assigned = await tryAssignMessage(db, message.id);
   return assigned ?? message;

@@ -21,6 +21,13 @@ const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
   "postgresql://smsgateway:smsgateway@localhost:5432/smsgateway_test";
 
+function assertIsolatedTestDatabase(connectionString: string): void {
+  const databaseName = new URL(connectionString).pathname.replace(/^\/+/, "");
+  if (!/(^|[_-])test($|[_-])/i.test(databaseName)) {
+    throw new Error("Refusing to run integration tests against a non-test database");
+  }
+}
+
 let pool: pg.Pool;
 let app: ReturnType<typeof createApp>;
 
@@ -67,6 +74,7 @@ function gatewayAuth(gatewayId: string, secret: string) {
 }
 
 beforeAll(async () => {
+  assertIsolatedTestDatabase(TEST_DB_URL);
   process.env.DATABASE_URL = TEST_DB_URL;
   pool = new pg.Pool({ connectionString: TEST_DB_URL });
   const db = drizzle(pool, { schema });
@@ -167,6 +175,68 @@ describe("Message creation", () => {
     const data2 = await res2.json();
     expect(data1.id).toBe(data2.id);
   });
+
+  it("returns the same message for concurrent identical submissions", async () => {
+    const { apiKey, clientId } = await seedClient();
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "concurrent-idem-123",
+    };
+    const body = JSON.stringify({ to: "+12025550100", message: "Concurrent OTP" });
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        app.request("/api/v1/messages", { method: "POST", headers, body })
+      )
+    );
+    const payloads = await Promise.all(responses.map((response) => response.json()));
+    const ids = new Set(payloads.map((payload) => payload.id));
+
+    expect(responses.every((response) => [201, 202].includes(response.status))).toBe(true);
+    expect(ids.size).toBe(1);
+
+    const messageCount = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM messages WHERE client_id = $1",
+      [clientId]
+    );
+    const eventCount = await pool.query(
+      `SELECT COUNT(*)::int AS count
+       FROM message_events
+       WHERE message_id = $1 AND from_status IS NULL AND to_status = 'QUEUED'`,
+      [payloads[0].id]
+    );
+
+    expect(messageCount.rows[0].count).toBe(1);
+    expect(eventCount.rows[0].count).toBe(1);
+  });
+
+  it("rejects reuse of an idempotency key with a different payload", async () => {
+    const { apiKey } = await seedClient();
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": "changed-payload-idem-123",
+    };
+
+    const first = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ to: "+12025550100", message: "First payload" }),
+    });
+    expect([201, 202]).toContain(first.status);
+
+    const second = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ to: "+12025550100", message: "Changed payload" }),
+    });
+    const payload = await second.json();
+
+    expect(second.status).toBe(409);
+    expect(payload.error.code).toBe("IDEMPOTENCY_KEY_REUSED");
+  });
+
 });
 
 describe("Gateway registration", () => {
