@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/node-postgres";
 import * as schema from "../src/db/schema.js";
 import { createApp } from "../src/index.js";
+import { hashToken } from "../src/lib/crypto.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -258,6 +259,56 @@ describe("Gateway registration", () => {
       body: JSON.stringify({ token, name: "another" }),
     });
     expect(res.status).toBe(400);
+  });
+
+  it("rejects expired registration tokens", async () => {
+    await seedClient();
+    const token = await seedRegistrationToken();
+    await pool.query(
+      "UPDATE registration_tokens SET expires_at = NOW() - INTERVAL '1 second' WHERE token_hash = $1",
+      [hashToken(token)]
+    );
+
+    const res = await app.request("/api/v1/gateways/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, name: "expired-phone" }),
+    });
+    const payload = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(payload.error.code).toBe("TOKEN_EXPIRED");
+
+    const gateways = await pool.query("SELECT COUNT(*)::int AS count FROM gateways");
+    expect(gateways.rows[0].count).toBe(0);
+  });
+
+  it("allows only one gateway for concurrent redemption", async () => {
+    await seedClient();
+    const token = await seedRegistrationToken();
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        app.request("/api/v1/gateways/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, name: `concurrent-phone-${index}` }),
+        })
+      )
+    );
+    const payloads = await Promise.all(responses.map((response) => response.json()));
+    const successful = responses.filter((response) => response.status === 201);
+    const rejected = payloads.filter(
+      (payload) => payload.error?.code === "TOKEN_USED"
+    );
+
+    expect(successful).toHaveLength(1);
+    expect(rejected).toHaveLength(7);
+    expect(successful[0]).toBeDefined();
+    expect(payloads.find((payload) => payload.gatewayId)?.secret).toBeDefined();
+
+    const gateways = await pool.query("SELECT COUNT(*)::int AS count FROM gateways");
+    expect(gateways.rows[0].count).toBe(1);
   });
 
   it("rejects revoked gateway", async () => {

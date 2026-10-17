@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { eq, and, sql, lte, inArray, isNull, or } from "drizzle-orm";
+import { eq, and, sql, lte, gt, inArray, isNull, or } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
   apiClients,
@@ -63,31 +63,40 @@ export async function registerGateway(
   name: string
 ): Promise<{ gatewayId: string; secret: string }> {
   const tokenHash = hashToken(token);
-  const [regToken] = await db
-    .select()
-    .from(registrationTokens)
-    .where(eq(registrationTokens.tokenHash, tokenHash))
-    .limit(1);
+  const now = new Date();
 
-  if (!regToken) {
-    throw new AppError("INVALID_TOKEN", "Registration token is invalid", 401);
-  }
-  if (regToken.usedAt) {
-    throw new AppError("TOKEN_USED", "Registration token has already been used", 400);
-  }
-  if (regToken.expiresAt < new Date()) {
-    throw new AppError("TOKEN_EXPIRED", "Registration token has expired", 400);
-  }
-
-  const secret = generateGatewaySecret();
-  const secretHash = await hashSecret(secret);
-  const gatewayId = generateId();
-
-  await db.transaction(async (tx) => {
-    await tx
+  return db.transaction(async (tx) => {
+    const [consumedToken] = await tx
       .update(registrationTokens)
-      .set({ usedAt: new Date() })
-      .where(eq(registrationTokens.id, regToken.id));
+      .set({ usedAt: now })
+      .where(
+        and(
+          eq(registrationTokens.tokenHash, tokenHash),
+          isNull(registrationTokens.usedAt),
+          gt(registrationTokens.expiresAt, now)
+        )
+      )
+      .returning();
+
+    if (!consumedToken) {
+      const [regToken] = await tx
+        .select()
+        .from(registrationTokens)
+        .where(eq(registrationTokens.tokenHash, tokenHash))
+        .limit(1);
+
+      if (!regToken) {
+        throw new AppError("INVALID_TOKEN", "Registration token is invalid", 401);
+      }
+      if (regToken.usedAt) {
+        throw new AppError("TOKEN_USED", "Registration token has already been used", 400);
+      }
+      throw new AppError("TOKEN_EXPIRED", "Registration token has expired", 400);
+    }
+
+    const secret = generateGatewaySecret();
+    const secretHash = await hashSecret(secret);
+    const gatewayId = generateId();
 
     await tx.insert(gateways).values({
       id: gatewayId,
@@ -95,9 +104,9 @@ export async function registerGateway(
       secretHash,
       status: "OFFLINE",
     });
-  });
 
-  return { gatewayId, secret };
+    return { gatewayId, secret };
+  });
 }
 
 export async function authenticateGateway(
