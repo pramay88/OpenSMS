@@ -459,34 +459,58 @@ export async function pollJobs(db: Database, gatewayId: string): Promise<Message
 }
 
 export async function ackJob(db: Database, gatewayId: string, jobId: string): Promise<Message> {
-  const now = new Date();
-  const claimExpiresAt = new Date(now.getTime() + config.jobClaimTtlSeconds * 1000);
+  return db.transaction(async (tx) => {
+    const [existing] = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.id, jobId), eq(messages.gatewayId, gatewayId)))
+      .for("update");
 
-  const [message] = await db
-    .update(messages)
-    .set({
-      status: "SENDING",
-      claimedAt: now,
-      claimExpiresAt,
-    })
-    .where(
-      and(
-        eq(messages.id, jobId),
-        eq(messages.gatewayId, gatewayId),
-        inArray(messages.status, ["ASSIGNED", "SENDING"])
+    if (!existing) {
+      throw new AppError("NOT_FOUND", "Job not found or not assigned to this gateway", 404);
+    }
+
+    const now = new Date();
+    if (
+      ["SENT", "FAILED", "EXPIRED"].includes(existing.status) ||
+      (existing.claimExpiresAt && existing.claimExpiresAt <= now)
+    ) {
+      throw new AppError("INVALID_STATE", "Job claim is no longer valid", 409);
+    }
+
+    if (existing.status === "SENDING") {
+      return existing;
+    }
+    if (existing.status !== "ASSIGNED") {
+      throw new AppError("INVALID_STATE", `Job cannot be acknowledged from ${existing.status}`, 409);
+    }
+
+    const claimExpiresAt = new Date(now.getTime() + config.jobClaimTtlSeconds * 1000);
+    const [message] = await tx
+      .update(messages)
+      .set({
+        status: "SENDING",
+        claimedAt: now,
+        claimExpiresAt,
+        attemptCount: sql`${messages.attemptCount} + 1`,
+      })
+      .where(
+        and(
+          eq(messages.id, jobId),
+          eq(messages.gatewayId, gatewayId),
+          eq(messages.status, "ASSIGNED"),
+          sql`${messages.expiresAt} > ${now}`
+        )
       )
-    )
-    .returning();
+      .returning();
 
-  if (!message) {
-    throw new AppError("NOT_FOUND", "Job not found or not assigned to this gateway", 404);
-  }
+    if (!message) {
+      throw new AppError("INVALID_STATE", "Job claim is no longer valid", 409);
+    }
 
-  if (message.status === "ASSIGNED") {
-    await recordEvent(db, jobId, "ASSIGNED", "SENDING");
-  }
-
-  return message;
+    await recordEvent(tx, jobId, "ASSIGNED", "SENDING");
+    return message;
+  });
 }
 
 export async function reportJobResult(
@@ -497,110 +521,143 @@ export async function reportJobResult(
   errorCode?: string,
   errorMessage?: string
 ): Promise<Message> {
-  const [existing] = await db
-    .select()
-    .from(messages)
-    .where(and(eq(messages.id, jobId), eq(messages.gatewayId, gatewayId)))
-    .limit(1);
+  return db.transaction(async (tx) => {
+    const [existing] = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.id, jobId), eq(messages.gatewayId, gatewayId)))
+      .for("update");
 
-  if (!existing) {
-    throw new AppError("NOT_FOUND", "Job not found or not assigned to this gateway", 404);
-  }
+    if (!existing) {
+      throw new AppError("NOT_FOUND", "Job not found or not assigned to this gateway", 404);
+    }
 
-  if (existing.status === "SENT" && success) {
-    return existing;
-  }
-  if (existing.status === "FAILED" && !success) {
-    return existing;
-  }
-  if (["SENT", "FAILED", "EXPIRED"].includes(existing.status)) {
-    throw new AppError("INVALID_STATE", `Job is already in terminal state: ${existing.status}`, 409);
-  }
+    if (existing.status === "SENT" && success) return existing;
+    if (existing.status === "FAILED" && !success) return existing;
+    if (["SENT", "FAILED", "EXPIRED"].includes(existing.status)) {
+      throw new AppError("INVALID_STATE", `Job is already in terminal state: ${existing.status}`, 409);
+    }
 
-  const now = new Date();
-  const fromStatus = existing.status;
+    const now = new Date();
+    if (
+      existing.status !== "SENDING" ||
+      (existing.claimExpiresAt && existing.claimExpiresAt <= now) ||
+      existing.expiresAt <= now
+    ) {
+      throw new AppError("INVALID_STATE", "Job claim is no longer valid", 409);
+    }
 
-  if (success) {
-    const [updated] = await db
+    const fromStatus = existing.status;
+    const [updated] = await tx
       .update(messages)
-      .set({ status: "SENT", sentAt: now, errorCode: null, errorMessage: null })
-      .where(eq(messages.id, jobId))
+      .set(
+        success
+          ? {
+              status: "SENT",
+              sentAt: now,
+              claimExpiresAt: null,
+              errorCode: null,
+              errorMessage: null,
+            }
+          : {
+              status: "FAILED",
+              failedAt: now,
+              claimExpiresAt: null,
+              errorCode: errorCode ?? "SEND_FAILED",
+              errorMessage: errorMessage ?? "SMS send failed",
+            }
+      )
+      .where(
+        and(
+          eq(messages.id, jobId),
+          eq(messages.gatewayId, gatewayId),
+          eq(messages.status, "SENDING")
+        )
+      )
       .returning();
-    await db
+
+    if (!updated) {
+      throw new AppError("INVALID_STATE", "Job state changed before the result was recorded", 409);
+    }
+
+    await tx
       .update(gateways)
       .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
       .where(eq(gateways.id, gatewayId));
-    await recordEvent(db, jobId, fromStatus, "SENT");
+    await recordEvent(
+      tx,
+      jobId,
+      fromStatus,
+      success ? "SENT" : "FAILED",
+      success ? undefined : JSON.stringify({ errorCode, errorMessage })
+    );
     return updated;
-  }
-
-  const [updated] = await db
-    .update(messages)
-    .set({
-      status: "FAILED",
-      failedAt: now,
-      errorCode: errorCode ?? "SEND_FAILED",
-      errorMessage: errorMessage ?? "SMS send failed",
-    })
-    .where(eq(messages.id, jobId))
-    .returning();
-  await db
-    .update(gateways)
-    .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
-    .where(eq(gateways.id, gatewayId));
-  await recordEvent(db, jobId, fromStatus, "FAILED", JSON.stringify({ errorCode, errorMessage }));
-  return updated;
+  });
 }
 
 export async function runMaintenance(db: Database) {
   const now = new Date();
 
-  const expired = await db
-    .update(messages)
-    .set({ status: "EXPIRED" })
-    .where(
-      and(
-        inArray(messages.status, ["QUEUED", "ASSIGNED"]),
-        lte(messages.expiresAt, now)
+  const { expired, stuck } = await db.transaction(async (tx) => {
+    const expired = await tx
+      .select()
+      .from(messages)
+      .where(
+        and(
+          inArray(messages.status, ["QUEUED", "ASSIGNED"]),
+          lte(messages.expiresAt, now)
+        )
       )
-    )
-    .returning();
+      .for("update", { skipLocked: true });
 
-  for (const msg of expired) {
-    await recordEvent(db, msg.id, msg.status === "EXPIRED" ? null : msg.status, "EXPIRED");
-    if (msg.gatewayId) {
-      await db
-        .update(gateways)
-        .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
-        .where(eq(gateways.id, msg.gatewayId));
+    for (const msg of expired) {
+      await tx
+        .update(messages)
+        .set({ status: "EXPIRED", claimExpiresAt: null })
+        .where(and(eq(messages.id, msg.id), inArray(messages.status, ["QUEUED", "ASSIGNED"])));
+      await recordEvent(tx, msg.id, msg.status, "EXPIRED");
+      if (msg.gatewayId) {
+        await tx
+          .update(gateways)
+          .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
+          .where(eq(gateways.id, msg.gatewayId));
+      }
     }
-  }
 
-  const stuck = await db
-    .update(messages)
-    .set({
-      status: "FAILED",
-      failedAt: now,
-      errorCode: "DELIVERY_UNCERTAIN",
-      errorMessage: "Job claim expired without delivery confirmation",
-    })
-    .where(
-      and(
-        eq(messages.status, "SENDING"),
-        lte(messages.claimExpiresAt, now)
-      )
-    )
-    .returning();
+    const stuck = await tx
+      .select()
+      .from(messages)
+      .where(and(eq(messages.status, "SENDING"), lte(messages.claimExpiresAt, now)))
+      .for("update", { skipLocked: true });
 
-  for (const msg of stuck) {
-    await recordEvent(db, msg.id, "SENDING", "FAILED", JSON.stringify({ errorCode: "DELIVERY_UNCERTAIN" }));
-    if (msg.gatewayId) {
-      await db
-        .update(gateways)
-        .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
-        .where(eq(gateways.id, msg.gatewayId));
+    for (const msg of stuck) {
+      await tx
+        .update(messages)
+        .set({
+          status: "FAILED",
+          failedAt: now,
+          claimExpiresAt: null,
+          errorCode: "DELIVERY_UNCERTAIN",
+          errorMessage: "Job claim expired without delivery confirmation",
+        })
+        .where(and(eq(messages.id, msg.id), eq(messages.status, "SENDING")));
+      await recordEvent(
+        tx,
+        msg.id,
+        "SENDING",
+        "FAILED",
+        JSON.stringify({ errorCode: "DELIVERY_UNCERTAIN" })
+      );
+      if (msg.gatewayId) {
+        await tx
+          .update(gateways)
+          .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
+          .where(eq(gateways.id, msg.gatewayId));
+      }
     }
-  }
+
+    return { expired, stuck };
+  });
 
   const heartbeatCutoff = new Date(now.getTime() - config.heartbeatTtlSeconds * 1000);
   await db

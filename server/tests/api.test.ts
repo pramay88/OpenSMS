@@ -500,6 +500,148 @@ describe("Job delivery flow", () => {
     expect(revoked.status).toBe(403);
   });
 
+  async function createAssignedJob(gateway: { gatewayId: string; secret: string }) {
+    const { apiKey } = await seedClient();
+    const messageResponse = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Transition test" }),
+    });
+    expect(messageResponse.status).toBe(201);
+    const message = await messageResponse.json();
+    const jobsResponse = await app.request("/api/v1/gateways/jobs", {
+      headers: { Authorization: gatewayAuth(gateway.gatewayId, gateway.secret) },
+    });
+    const jobs = await jobsResponse.json();
+    return { message, job: jobs.jobs[0] };
+  }
+
+  it("makes duplicate acknowledgements idempotent", async () => {
+    const gateway = await setupOnlineGateway();
+    const { job } = await createAssignedJob(gateway);
+    const headers = { Authorization: gatewayAuth(gateway.gatewayId, gateway.secret) };
+
+    const first = await app.request(`/api/v1/gateways/jobs/${job.id}/ack`, {
+      method: "POST",
+      headers,
+    });
+    const second = await app.request(`/api/v1/gateways/jobs/${job.id}/ack`, {
+      method: "POST",
+      headers,
+    });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect((await second.json()).status).toBe("SENDING");
+    const events = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'SENDING'",
+      [job.id]
+    );
+    expect(events.rows[0].count).toBe(1);
+  });
+
+  it("makes repeated identical results idempotent and rejects conflicts", async () => {
+    const gateway = await setupOnlineGateway();
+    const { job } = await createAssignedJob(gateway);
+    const headers = {
+      Authorization: gatewayAuth(gateway.gatewayId, gateway.secret),
+      "Content-Type": "application/json",
+    };
+    await app.request(`/api/v1/gateways/jobs/${job.id}/ack`, {
+      method: "POST",
+      headers,
+    });
+
+    const first = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ success: true }),
+    });
+    const duplicate = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ success: true }),
+    });
+    const conflict = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ success: false, errorCode: "SEND_FAILED" }),
+    });
+
+    expect(first.status).toBe(200);
+    expect(duplicate.status).toBe(200);
+    expect(conflict.status).toBe(409);
+    const events = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'SENT'",
+      [job.id]
+    );
+    expect(events.rows[0].count).toBe(1);
+  });
+
+  it("rejects wrong-gateway, stale, and concurrent conflicting results", async () => {
+    const gateway = await setupOnlineGateway();
+    const { job } = await createAssignedJob(gateway);
+    const otherGateway = await setupOnlineGateway();
+    const gatewayHeaders = {
+      Authorization: gatewayAuth(gateway.gatewayId, gateway.secret),
+      "Content-Type": "application/json",
+    };
+    await app.request(`/api/v1/gateways/jobs/${job.id}/ack`, {
+      method: "POST",
+      headers: gatewayHeaders,
+    });
+
+    const wrongGateway = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+      method: "POST",
+      headers: {
+        Authorization: gatewayAuth(otherGateway.gatewayId, otherGateway.secret),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ success: true }),
+    });
+    expect(wrongGateway.status).toBe(404);
+
+    await pool.query(
+      "UPDATE messages SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+      [job.id]
+    );
+    const stale = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+      method: "POST",
+      headers: gatewayHeaders,
+      body: JSON.stringify({ success: true }),
+    });
+    expect(stale.status).toBe(409);
+
+    await pool.query(
+      "UPDATE messages SET claim_expires_at = NOW() + INTERVAL '1 minute' WHERE id = $1",
+      [job.id]
+    );
+    const concurrent = await Promise.all([
+      app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+        method: "POST",
+        headers: gatewayHeaders,
+        body: JSON.stringify({ success: true }),
+      }),
+      app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+        method: "POST",
+        headers: gatewayHeaders,
+        body: JSON.stringify({ success: false, errorCode: "SEND_FAILED" }),
+      }),
+    ]);
+    expect(concurrent.filter((response) => response.status === 200)).toHaveLength(1);
+    expect(concurrent.filter((response) => response.status === 409)).toHaveLength(1);
+
+    const counts = await pool.query(
+      "SELECT status, active_job_count FROM messages JOIN gateways ON gateways.id = messages.gateway_id WHERE messages.id = $1",
+      [job.id]
+    );
+    expect(["SENT", "FAILED"]).toContain(counts.rows[0].status);
+    expect(counts.rows[0].active_job_count).toBe(0);
+  });
+
   it("reports failed delivery", async () => {
     const { apiKey } = await seedClient();
     const gw = await setupOnlineGateway();
