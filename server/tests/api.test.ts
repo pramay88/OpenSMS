@@ -392,6 +392,114 @@ describe("Job delivery flow", () => {
     expect(status.status).toBe("SENT");
   });
 
+  async function createQueuedMessage() {
+    const { apiKey } = await seedClient();
+    const res = await app.request("/api/v1/messages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ to: "+12025550100", message: "Queued for polling" }),
+    });
+    expect(res.status).toBe(202);
+    return res.json() as Promise<{ id: string }>;
+  }
+
+  async function registerOfflineGateway(name: string) {
+    const token = await seedRegistrationToken();
+    return registerGateway(token, name);
+  }
+
+  it("claims a queued message only once when gateways poll concurrently", async () => {
+    const first = await registerOfflineGateway("poller-one");
+    const second = await registerOfflineGateway("poller-two");
+    const message = await createQueuedMessage();
+
+    await pool.query(
+      "UPDATE gateways SET status = 'ONLINE', last_heartbeat_at = NOW() WHERE id = ANY($1::uuid[])",
+      [[first.gatewayId, second.gatewayId]]
+    );
+
+    const responses = await Promise.all([
+      app.request("/api/v1/gateways/jobs", {
+        headers: { Authorization: gatewayAuth(first.gatewayId, first.secret) },
+      }),
+      app.request("/api/v1/gateways/jobs", {
+        headers: { Authorization: gatewayAuth(second.gatewayId, second.secret) },
+      }),
+    ]);
+    const payloads = await Promise.all(responses.map((response) => response.json()));
+    const claimed = payloads.flatMap((payload) =>
+      payload.jobs.filter((job: { id: string }) => job.id === message.id)
+    );
+
+    expect(claimed).toHaveLength(1);
+    const count = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM messages WHERE id = $1 AND status = 'ASSIGNED'",
+      [message.id]
+    );
+    const events = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'ASSIGNED'",
+      [message.id]
+    );
+    expect(count.rows[0].count).toBe(1);
+    expect(events.rows[0].count).toBe(1);
+  });
+
+  it("returns the same claimed job on repeated polling by one gateway", async () => {
+    const gateway = await registerOfflineGateway("repeat-poller");
+    const message = await createQueuedMessage();
+    await pool.query(
+      "UPDATE gateways SET status = 'ONLINE', last_heartbeat_at = NOW() WHERE id = $1",
+      [gateway.gatewayId]
+    );
+
+    const headers = { Authorization: gatewayAuth(gateway.gatewayId, gateway.secret) };
+    const first = await (await app.request("/api/v1/gateways/jobs", { headers })).json();
+    const second = await (await app.request("/api/v1/gateways/jobs", { headers })).json();
+
+    expect(first.jobs.map((job: { id: string }) => job.id)).toContain(message.id);
+    expect(second.jobs.map((job: { id: string }) => job.id)).toContain(message.id);
+    const events = await pool.query(
+      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'ASSIGNED'",
+      [message.id]
+    );
+    expect(events.rows[0].count).toBe(1);
+  });
+
+  it("does not claim expired messages or allow paused gateways to poll", async () => {
+    const gateway = await registerOfflineGateway("paused-poller");
+    const message = await createQueuedMessage();
+    await pool.query(
+      "UPDATE messages SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+      [message.id]
+    );
+    await pool.query(
+      "UPDATE gateways SET status = 'ONLINE', last_heartbeat_at = NOW() WHERE id = $1",
+      [gateway.gatewayId]
+    );
+
+    const headers = { Authorization: gatewayAuth(gateway.gatewayId, gateway.secret) };
+    const expired = await (await app.request("/api/v1/gateways/jobs", { headers })).json();
+    expect(expired.jobs).toHaveLength(0);
+
+    await pool.query(
+      "UPDATE gateways SET status = 'PAUSED', paused = TRUE WHERE id = $1",
+      [gateway.gatewayId]
+    );
+    const paused = await app.request("/api/v1/gateways/jobs", { headers });
+    expect(paused.status).toBe(200);
+    expect((await paused.json()).jobs).toHaveLength(0);
+
+    await pool.query(
+      "UPDATE gateways SET status = 'REVOKED', revoked_at = NOW() WHERE id = $1",
+      [gateway.gatewayId]
+    );
+    const revoked = await app.request("/api/v1/gateways/jobs", { headers });
+    expect(revoked.status).toBe(403);
+  });
+
   it("reports failed delivery", async () => {
     const { apiKey } = await seedClient();
     const gw = await setupOnlineGateway();

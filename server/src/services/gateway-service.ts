@@ -237,7 +237,9 @@ export async function createMessage(
   return assigned ?? message;
 }
 
-async function findOnlineGateway(db: Database): Promise<Gateway | null> {
+async function findOnlineGateway(
+  db: Database | DatabaseTransaction
+): Promise<Gateway | null> {
   const heartbeatCutoff = new Date(Date.now() - config.heartbeatTtlSeconds * 1000);
   const [gateway] = await db
     .select()
@@ -255,28 +257,59 @@ async function findOnlineGateway(db: Database): Promise<Gateway | null> {
 }
 
 export async function tryAssignMessage(db: Database, messageId: string): Promise<Message | null> {
-  const gateway = await findOnlineGateway(db);
-  if (!gateway) return null;
+  return db.transaction(async (tx) => {
+    const gateway = await findOnlineGateway(tx);
+    if (!gateway) return null;
 
-  const now = new Date();
-  const [updated] = await db
-    .update(messages)
-    .set({
-      status: "ASSIGNED",
-      gatewayId: gateway.id,
-      assignedAt: now,
-    })
-    .where(and(eq(messages.id, messageId), eq(messages.status, "QUEUED")))
-    .returning();
+    const [lockedGateway] = await tx
+      .select()
+      .from(gateways)
+      .where(
+        and(
+          eq(gateways.id, gateway.id),
+          eq(gateways.status, "ONLINE"),
+          isNull(gateways.revokedAt),
+          eq(gateways.paused, false),
+          sql`${gateways.lastHeartbeatAt} >= ${new Date(
+            Date.now() - config.heartbeatTtlSeconds * 1000
+          )}`
+        )
+      )
+      .for("update");
+    if (!lockedGateway) return null;
 
-  if (updated) {
-    await db
+    const now = new Date();
+    const [updated] = await tx
+      .update(messages)
+      .set({
+        status: "ASSIGNED",
+        gatewayId: lockedGateway.id,
+        assignedAt: now,
+      })
+      .where(
+        and(
+          eq(messages.id, messageId),
+          eq(messages.status, "QUEUED"),
+          sql`${messages.expiresAt} > ${now}`
+        )
+      )
+      .returning();
+
+    if (!updated) return null;
+
+    await tx
       .update(gateways)
       .set({ activeJobCount: sql`${gateways.activeJobCount} + 1` })
-      .where(eq(gateways.id, gateway.id));
-    await recordEvent(db, messageId, "QUEUED", "ASSIGNED", JSON.stringify({ gatewayId: gateway.id }));
-  }
-  return updated ?? null;
+      .where(eq(gateways.id, lockedGateway.id));
+    await recordEvent(
+      tx,
+      messageId,
+      "QUEUED",
+      "ASSIGNED",
+      JSON.stringify({ gatewayId: lockedGateway.id })
+    );
+    return updated;
+  });
 }
 
 export async function getMessage(db: Database, messageId: string, clientId: string) {
@@ -332,46 +365,97 @@ async function assignQueuedMessages(db: Database) {
 }
 
 export async function pollJobs(db: Database, gatewayId: string): Promise<Message[]> {
-  const now = new Date();
-  const claimExpiresAt = new Date(now.getTime() + config.jobClaimTtlSeconds * 1000);
-
-  const assigned = await db
-    .select()
-    .from(messages)
-    .where(
-      and(
-        eq(messages.gatewayId, gatewayId),
-        inArray(messages.status, ["ASSIGNED", "SENDING"]),
-        sql`${messages.expiresAt} > NOW()`
+  return db.transaction(async (tx) => {
+    const now = new Date();
+    const heartbeatCutoff = new Date(
+      now.getTime() - config.heartbeatTtlSeconds * 1000
+    );
+    const [gateway] = await tx
+      .select()
+      .from(gateways)
+      .where(
+        and(
+          eq(gateways.id, gatewayId),
+          eq(gateways.status, "ONLINE"),
+          isNull(gateways.revokedAt),
+          eq(gateways.paused, false),
+          sql`${gateways.lastHeartbeatAt} >= ${heartbeatCutoff}`
+        )
       )
-    )
-    .limit(5);
+      .for("update");
 
-  const claimed: Message[] = [...assigned];
+    if (!gateway) return [];
 
-  const [newJob] = await db
-    .update(messages)
-    .set({
-      status: "ASSIGNED",
-      gatewayId,
-      assignedAt: now,
-      claimedAt: now,
-      claimExpiresAt,
-    })
-    .where(
-      and(
-        eq(messages.status, "QUEUED"),
-        sql`${messages.expiresAt} > NOW()`,
-        or(isNull(messages.gatewayId), eq(messages.gatewayId, gatewayId))
+    const assigned = await tx
+      .select()
+      .from(messages)
+      .where(
+        and(
+          eq(messages.gatewayId, gatewayId),
+          inArray(messages.status, ["ASSIGNED", "SENDING"]),
+          sql`${messages.expiresAt} > ${now}`
+        )
       )
-    )
-    .returning();
+      .limit(5);
 
-  if (newJob && !claimed.find((j) => j.id === newJob.id)) {
-    claimed.push(newJob);
-  }
+    const claimed: Message[] = [...assigned];
+    const claimExpiresAt = new Date(
+      now.getTime() + config.jobClaimTtlSeconds * 1000
+    );
 
-  return claimed.slice(0, 5);
+    while (claimed.length < 5) {
+      const [queued] = await tx
+        .select()
+        .from(messages)
+        .where(
+          and(
+            eq(messages.status, "QUEUED"),
+            sql`${messages.expiresAt} > ${now}`,
+            or(isNull(messages.gatewayId), eq(messages.gatewayId, gatewayId))
+          )
+        )
+        .orderBy(messages.createdAt)
+        .limit(1)
+        .for("update", { skipLocked: true });
+
+      if (!queued) break;
+
+      const [updated] = await tx
+        .update(messages)
+        .set({
+          status: "ASSIGNED",
+          gatewayId,
+          assignedAt: now,
+          claimedAt: now,
+          claimExpiresAt,
+        })
+        .where(
+          and(
+            eq(messages.id, queued.id),
+            eq(messages.status, "QUEUED"),
+            sql`${messages.expiresAt} > ${now}`
+          )
+        )
+        .returning();
+
+      if (!updated) continue;
+
+      claimed.push(updated);
+      await tx
+        .update(gateways)
+        .set({ activeJobCount: sql`${gateways.activeJobCount} + 1` })
+        .where(eq(gateways.id, gatewayId));
+      await recordEvent(
+        tx,
+        updated.id,
+        "QUEUED",
+        "ASSIGNED",
+        JSON.stringify({ gatewayId })
+      );
+    }
+
+    return claimed;
+  });
 }
 
 export async function ackJob(db: Database, gatewayId: string, jobId: string): Promise<Message> {
