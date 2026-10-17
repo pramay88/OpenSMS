@@ -6,11 +6,23 @@ import { messages } from "./routes/messages.js";
 import { gateways, admin, maintenance } from "./routes/gateways.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import type { AppEnv } from "./types.js";
+import { randomUUID } from "node:crypto";
+import { config } from "./config.js";
 
 export function createApp() {
   const app = new Hono<AppEnv>();
 
-  app.use("*", cors());
+  app.use("*", async (c, next) => {
+    c.set("requestId", randomUUID());
+    await next();
+  });
+  app.use(
+    "*",
+    cors({
+      origin: (origin) =>
+        config.corsOrigins.includes(origin) ? origin : undefined,
+    })
+  );
 
   app.route("/api/v1/health", health);
   app.route("/api/v1/messages", messages);

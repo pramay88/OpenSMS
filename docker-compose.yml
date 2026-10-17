@@ -23,13 +23,14 @@ services:
       - "3000:3000"
     environment:
       DATABASE_URL: postgresql://smsgateway:smsgateway@postgres:5432/smsgateway
-      ADMIN_SECRET: ${ADMIN_SECRET:-change-me-admin-secret}
-      CRON_SECRET: ${CRON_SECRET:-change-me-cron-secret}
+      ADMIN_SECRET: ${ADMIN_SECRET:?ADMIN_SECRET must be set}
+      CRON_SECRET: ${CRON_SECRET:?CRON_SECRET must be set}
       API_RATE_LIMIT_PER_MIN: ${API_RATE_LIMIT_PER_MIN:-60}
       MESSAGE_TTL_SECONDS: ${MESSAGE_TTL_SECONDS:-300}
       JOB_CLAIM_TTL_SECONDS: ${JOB_CLAIM_TTL_SECONDS:-120}
       HEARTBEAT_TTL_SECONDS: ${HEARTBEAT_TTL_SECONDS:-90}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       NODE_ENV: production
       PORT: 3000
     depends_on:

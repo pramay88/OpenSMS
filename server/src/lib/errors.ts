@@ -40,13 +40,16 @@ export function logError(message: string, meta?: Record<string, unknown>): void 
   console.error(JSON.stringify({ level: "error", message, ...safe }));
 }
 
-function sanitizeLogMeta(meta: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeLogMeta(meta: Record<string, unknown>): Record<string, unknown> {
   const sanitized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(meta)) {
-    if (["body", "message", "secret", "apiKey", "token", "authorization"].includes(key)) {
+    if (
+      ["body", "message", "secret", "apiKey", "token", "authorization", "credentials",
+        "phone", "to", "idempotencyKey", "error", "details", "record"].includes(key)
+    ) {
       sanitized[key] = "[redacted]";
-    } else if (key === "to" && typeof value === "string") {
-      sanitized[key] = value.length > 6 ? value.slice(0, 3) + "***" + value.slice(-3) : "***";
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      sanitized[key] = sanitizeLogMeta(value as Record<string, unknown>);
     } else {
       sanitized[key] = value;
     }

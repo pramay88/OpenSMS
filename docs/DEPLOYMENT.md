@@ -13,6 +13,7 @@
 | HEARTBEAT_TTL_SECONDS | No | 90 | Gateway online threshold |
 | REGISTRATION_TOKEN_TTL_SECONDS | No | 3600 | Setup token lifetime |
 | LOG_LEVEL | No | info | Logging level |
+| CORS_ORIGINS | No | — | Comma-separated explicit browser origins |
 | PORT | No | 3000 | Server port (VPS/Docker) |
 
 Copy `server/.env.example` to `server/.env` and configure.
@@ -25,6 +26,7 @@ Copy `server/.env.example` to `server/.env` and configure.
 # From repository root
 export ADMIN_SECRET=$(openssl rand -hex 32)
 export CRON_SECRET=$(openssl rand -hex 32)
+export CORS_ORIGINS=https://admin.example.com
 
 docker compose up -d
 ```
@@ -146,6 +148,7 @@ Docker Compose includes a healthcheck on the server service.
 
 - [ ] Strong `ADMIN_SECRET` and `CRON_SECRET`
 - [ ] HTTPS/TLS enabled
+- [ ] `CORS_ORIGINS` is explicitly restricted, or unset when browser access is unnecessary
 - [ ] PostgreSQL backups configured
 - [ ] API keys created and stored securely
 - [ ] Rate limits configured appropriately

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { beforeAll, afterAll, beforeEach, describe, it, expect } from "vitest";
+import { beforeAll, afterAll, beforeEach, describe, it, expect, vi } from "vitest";
 import pg from "pg";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import path from "node:path";
@@ -8,22 +8,27 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import * as schema from "../src/db/schema.js";
 import { createApp } from "../src/index.js";
 import { hashToken } from "../src/lib/crypto.js";
+import { config } from "../src/config.js";
+
+vi.hoisted(() => {
+  process.env.ADMIN_SECRET = "test-admin-secret";
+  process.env.CRON_SECRET = "test-cron-secret";
+  process.env.API_RATE_LIMIT_PER_MIN = "1000";
+  process.env.MESSAGE_TTL_SECONDS = "300";
+  process.env.JOB_CLAIM_TTL_SECONDS = "120";
+  process.env.HEARTBEAT_TTL_SECONDS = "90";
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-process.env.ADMIN_SECRET = "test-admin-secret";
-process.env.CRON_SECRET = "test-cron-secret";
-process.env.API_RATE_LIMIT_PER_MIN = "1000";
-process.env.MESSAGE_TTL_SECONDS = "300";
-process.env.JOB_CLAIM_TTL_SECONDS = "120";
-process.env.HEARTBEAT_TTL_SECONDS = "90";
-
-const TEST_DB_URL =
-  process.env.TEST_DATABASE_URL ??
-  "postgresql://smsgateway:smsgateway@localhost:5432/smsgateway_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL;
 
 function assertIsolatedTestDatabase(connectionString: string): void {
-  const databaseName = new URL(connectionString).pathname.replace(/^\/+/, "");
+  const parsed = new URL(connectionString);
+  if (!["localhost", "127.0.0.1", "::1"].includes(parsed.hostname)) {
+    throw new Error("TEST_DATABASE_URL must target a local PostgreSQL host");
+  }
+  const databaseName = parsed.pathname.replace(/^\/+/, "");
   if (!/(^|[_-])test($|[_-])/i.test(databaseName)) {
     throw new Error("Refusing to run integration tests against a non-test database");
   }
@@ -75,9 +80,15 @@ function gatewayAuth(gatewayId: string, secret: string) {
 }
 
 beforeAll(async () => {
-  assertIsolatedTestDatabase(TEST_DB_URL);
-  process.env.DATABASE_URL = TEST_DB_URL;
-  pool = new pg.Pool({ connectionString: TEST_DB_URL });
+  const explicitTestDatabaseUrl = process.env.TEST_DATABASE_URL;
+  if (!explicitTestDatabaseUrl) {
+    throw new Error(
+      "TEST_DATABASE_URL is required; refusing to use DATABASE_URL or an implicit database"
+    );
+  }
+  assertIsolatedTestDatabase(explicitTestDatabaseUrl);
+  process.env.DATABASE_URL = explicitTestDatabaseUrl;
+  pool = new pg.Pool({ connectionString: explicitTestDatabaseUrl });
   const db = drizzle(pool, { schema });
   const migrationsFolder = path.join(__dirname, "../drizzle");
   await migrate(db, { migrationsFolder });
@@ -635,7 +646,7 @@ describe("Job delivery flow", () => {
     expect(concurrent.filter((response) => response.status === 409)).toHaveLength(1);
 
     const counts = await pool.query(
-      "SELECT status, active_job_count FROM messages JOIN gateways ON gateways.id = messages.gateway_id WHERE messages.id = $1",
+      "SELECT messages.status, gateways.active_job_count FROM messages JOIN gateways ON gateways.id = messages.gateway_id WHERE messages.id = $1",
       [job.id]
     );
     expect(["SENT", "FAILED"]).toContain(counts.rows[0].status);
@@ -701,7 +712,7 @@ describe("Job delivery flow", () => {
 describe("Expired messages", () => {
   it("expires old queued messages via maintenance", async () => {
     const { apiKey } = await seedClient();
-    process.env.MESSAGE_TTL_SECONDS = "0";
+    config.messageTtlSeconds = 0;
 
     const res = await app.request("/api/v1/messages", {
       method: "POST",
@@ -726,11 +737,16 @@ describe("Expired messages", () => {
     const status = await statusRes.json();
     expect(status.status).toBe("EXPIRED");
 
-    process.env.MESSAGE_TTL_SECONDS = "300";
+    config.messageTtlSeconds = 300;
   });
 });
 
 describe("Rate limiting", () => {
+  function useStableRateLimitWindow() {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-18T12:00:30.000Z"));
+  }
+
   function messageRequest(apiKey: string, message: string) {
     return app.request("/api/v1/messages", {
       method: "POST",
@@ -743,7 +759,8 @@ describe("Rate limiting", () => {
   }
 
   it("returns 429 when rate limit exceeded", async () => {
-    process.env.API_RATE_LIMIT_PER_MIN = "2";
+    useStableRateLimitWindow();
+    config.apiRateLimitPerMin = 2;
     const { apiKey } = await seedClient();
 
     for (let i = 0; i < 2; i++) {
@@ -754,11 +771,13 @@ describe("Rate limiting", () => {
     const res = await messageRequest(apiKey, "over limit");
     expect(res.status).toBe(429);
 
-    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+    config.apiRateLimitPerMin = 1000;
+    vi.useRealTimers();
   });
 
   it("enforces the limit without lost increments under concurrent requests", async () => {
-    process.env.API_RATE_LIMIT_PER_MIN = "2";
+    useStableRateLimitWindow();
+    config.apiRateLimitPerMin = 2;
     const { apiKey } = await seedClient();
 
     const responses = await Promise.all(
@@ -774,11 +793,13 @@ describe("Rate limiting", () => {
     );
     expect(buckets.rows[0].request_count).toBe(2);
 
-    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+    config.apiRateLimitPerMin = 1000;
+    vi.useRealTimers();
   });
 
   it("keeps rate-limit buckets isolated between clients", async () => {
-    process.env.API_RATE_LIMIT_PER_MIN = "1";
+    useStableRateLimitWindow();
+    config.apiRateLimitPerMin = 1;
     const first = await seedClient();
     const second = await seedClient();
 
@@ -786,7 +807,8 @@ describe("Rate limiting", () => {
     expect((await messageRequest(first.apiKey, "first over")).status).toBe(429);
     expect((await messageRequest(second.apiKey, "second")).status).not.toBe(429);
 
-    process.env.API_RATE_LIMIT_PER_MIN = "1000";
+    config.apiRateLimitPerMin = 1000;
+    vi.useRealTimers();
   });
 });
 

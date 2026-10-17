@@ -2,6 +2,7 @@
 import type { Gateway } from "./db/schema.js";
 
 export type AppVariables = {
+  requestId: string;
   clientId: string;
   clientName: string;
   gateway: Gateway;

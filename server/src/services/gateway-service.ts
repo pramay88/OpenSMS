@@ -687,24 +687,49 @@ export async function checkRateLimit(
 ): Promise<boolean> {
   const now = new Date();
   const windowStart = new Date(Math.floor(now.getTime() / 60000) * 60000);
-  const [bucket] = await db
-    .insert(rateLimitBuckets)
-    .values({
-      bucketKey,
-      windowStart,
-      requestCount: 1,
-    })
-    .onConflictDoUpdate({
-      target: [rateLimitBuckets.bucketKey, rateLimitBuckets.windowStart],
-      set: {
-        requestCount: sql`CASE
-          WHEN ${rateLimitBuckets.requestCount} < ${limit}
-            THEN ${rateLimitBuckets.requestCount} + 1
-          ELSE ${rateLimitBuckets.requestCount}
-        END`,
-      },
-    })
-    .returning({ requestCount: rateLimitBuckets.requestCount });
+  return db.transaction(async (tx) => {
+    const [inserted] = await tx
+      .insert(rateLimitBuckets)
+      .values({
+        bucketKey,
+        windowStart,
+        requestCount: 1,
+      })
+      .onConflictDoNothing({
+        target: [rateLimitBuckets.bucketKey, rateLimitBuckets.windowStart],
+      })
+      .returning({ requestCount: rateLimitBuckets.requestCount });
 
-  return (bucket?.requestCount ?? 0) <= limit;
+    if (inserted) {
+      return true;
+    }
+
+    const [bucket] = await tx
+      .select({
+        requestCount: rateLimitBuckets.requestCount,
+      })
+      .from(rateLimitBuckets)
+      .where(
+        and(
+          eq(rateLimitBuckets.bucketKey, bucketKey),
+          eq(rateLimitBuckets.windowStart, windowStart)
+        )
+      )
+      .for("update");
+
+    if (bucket.requestCount >= limit) {
+      return false;
+    }
+
+    await tx
+      .update(rateLimitBuckets)
+      .set({ requestCount: bucket.requestCount + 1 })
+      .where(
+        and(
+          eq(rateLimitBuckets.bucketKey, bucketKey),
+          eq(rateLimitBuckets.windowStart, windowStart)
+        )
+      );
+    return true;
+  });
 }

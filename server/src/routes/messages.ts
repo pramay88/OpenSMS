@@ -29,7 +29,6 @@ messages.post("/", clientAuthMiddleware, async (c) => {
 
   const idempotencyKey = c.req.header("Idempotency-Key") ?? undefined;
   const db = getDb();
-  console.log("REQUEST BODY:", parsed.data);
   const message = await createMessage(
     db,
     clientId,
@@ -38,7 +37,12 @@ messages.post("/", clientAuthMiddleware, async (c) => {
     idempotencyKey
   );
 
-  logInfo("Message queued", { messageId: message.id, clientId, status: message.status });
+  logInfo("Message queued", {
+    requestId: c.get("requestId"),
+    messageId: message.id,
+    clientId,
+    status: message.status,
+  });
 
   return c.json(toMessageResponse(message), message.status === "QUEUED" ? 202 : 201);
 });

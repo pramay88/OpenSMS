@@ -6,6 +6,9 @@ export function errorHandler(err: Error, c: Context) {
   if (err instanceof AppError) {
     return c.json(errorResponse(err), err.status as 400);
   }
-  logError("Unhandled error", { error: err.message });
+  logError("Unhandled error", {
+    requestId: c.get("requestId"),
+    errorType: err.name,
+  });
   return c.json(errorResponse(err), 500);
 }

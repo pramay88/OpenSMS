@@ -35,12 +35,14 @@ SIM / Mobile Network → Recipient
 
 ```bash
 cp server/.env.example server/.env
-# Edit ADMIN_SECRET and CRON_SECRET in server/.env
+# Edit ADMIN_SECRET and CRON_SECRET in server/.env. Never use these development
+# values in production.
 
 docker compose up -d
 ```
 
-Server runs at `http://localhost:3000`.
+Server runs at `http://localhost:3000` for local development. Production
+deployments must terminate HTTPS before reaching the server.
 
 ### 2. Create credentials
 
@@ -154,6 +156,9 @@ See [docs/SECURITY.md](docs/SECURITY.md).
 ## Production Considerations
 
 - Use HTTPS everywhere
+- Production startup rejects missing or `change-me-*` admin/cron secrets.
+- Set `CORS_ORIGINS` to an explicit comma-separated allowlist only when browser
+  access is required; CORS is not authentication.
 - Rotate API keys and registration tokens
 - Monitor gateway heartbeats
 - Set up cron/maintenance (automatic on Vercel)
