@@ -686,6 +686,9 @@ export async function reportJobResult(
   gatewayId: string,
   jobId: string,
   success: boolean,
+  deliveryStatus: "SUBMITTED" | "DELIVERED" | "DELIVERY_FAILED" | "UNKNOWN" = success
+    ? "SUBMITTED"
+    : "DELIVERY_FAILED",
   errorCode?: string,
   errorMessage?: string
 ): Promise<Message> {
@@ -700,39 +703,64 @@ export async function reportJobResult(
       throw new AppError("NOT_FOUND", "Job not found or not assigned to this gateway", 404);
     }
 
-    if (existing.status === "SENT" && success) return existing;
+    if ((existing.status === "DELIVERED" || existing.status === "SENT") && success) return existing;
     if (existing.status === "FAILED" && !success) return existing;
-    if (["SENT", "FAILED", "EXPIRED"].includes(existing.status)) {
+    if (existing.status === "DELIVERY_PENDING" && success && deliveryStatus !== "DELIVERED") {
+      return existing;
+    }
+    if (["DELIVERED", "FAILED", "EXPIRED"].includes(existing.status)) {
       throw new AppError("INVALID_STATE", `Job is already in terminal state: ${existing.status}`, 409);
     }
 
     const now = new Date();
-    if (
-      existing.status !== "SENDING" ||
-      (existing.claimExpiresAt && existing.claimExpiresAt <= now) ||
-      existing.expiresAt <= now
-    ) {
+    const isSubmission = existing.status === "SENDING";
+    const isDeliveryUpdate = existing.status === "DELIVERY_PENDING";
+    if ((!isSubmission && !isDeliveryUpdate) || existing.expiresAt <= now) {
+      throw new AppError("INVALID_STATE", "Job claim is no longer valid", 409);
+    }
+    if (isSubmission && existing.claimExpiresAt && existing.claimExpiresAt <= now) {
       throw new AppError("INVALID_STATE", "Job claim is no longer valid", 409);
     }
 
     const fromStatus = existing.status;
+    const nextStatus = !success
+      ? "FAILED"
+      : deliveryStatus === "DELIVERED"
+        ? "DELIVERED"
+        : isSubmission
+          ? "DELIVERY_PENDING"
+          : "DELIVERY_PENDING";
     const [updated] = await tx
       .update(messages)
       .set(
-        success
+        !success
           ? {
-              status: "SENT",
-              sentAt: now,
-              claimExpiresAt: null,
-              errorCode: null,
-              errorMessage: null,
-            }
-          : {
               status: "FAILED",
               failedAt: now,
               claimExpiresAt: null,
               errorCode: errorCode ?? "SEND_FAILED",
               errorMessage: errorMessage ?? "SMS send failed",
+            }
+          : isSubmission
+          ? {
+              status: "DELIVERY_PENDING",
+              sentAt: now,
+              claimExpiresAt: null,
+              errorCode: null,
+              errorMessage: null,
+            }
+          : deliveryStatus === "DELIVERED"
+          ? {
+              status: "DELIVERED",
+              claimExpiresAt: null,
+              errorCode: null,
+              errorMessage: null,
+            }
+          : {
+              status: "DELIVERY_PENDING",
+              claimExpiresAt: null,
+              errorCode: null,
+              errorMessage: null,
             }
       )
       .where(
@@ -748,15 +776,17 @@ export async function reportJobResult(
       throw new AppError("INVALID_STATE", "Job state changed before the result was recorded", 409);
     }
 
-    await tx
-      .update(gateways)
-      .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
-      .where(eq(gateways.id, gatewayId));
+    if (isSubmission) {
+      await tx
+        .update(gateways)
+        .set({ activeJobCount: sql`GREATEST(0, ${gateways.activeJobCount} - 1)` })
+        .where(eq(gateways.id, gatewayId));
+    }
     await recordEvent(
       tx,
       jobId,
       fromStatus,
-      success ? "SENT" : "FAILED",
+      nextStatus,
       success ? undefined : JSON.stringify({ errorCode, errorMessage })
     );
     return updated;

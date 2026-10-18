@@ -400,7 +400,7 @@ describe("Job delivery flow", () => {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
     const status = await statusRes.json();
-    expect(status.status).toBe("SENT");
+    expect(status.status).toBe("DELIVERY_PENDING");
   });
 
   async function createQueuedMessage() {
@@ -576,17 +576,17 @@ describe("Job delivery flow", () => {
       headers,
       body: JSON.stringify({ success: true }),
     });
-    const conflict = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
+    const delivered = await app.request(`/api/v1/gateways/jobs/${job.id}/result`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ success: false, errorCode: "SEND_FAILED" }),
+      body: JSON.stringify({ success: true, deliveryStatus: "DELIVERED" }),
     });
 
     expect(first.status).toBe(200);
     expect(duplicate.status).toBe(200);
-    expect(conflict.status).toBe(409);
+    expect(delivered.status).toBe(200);
     const events = await pool.query(
-      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'SENT'",
+      "SELECT COUNT(*)::int AS count FROM message_events WHERE message_id = $1 AND to_status = 'DELIVERED'",
       [job.id]
     );
     expect(events.rows[0].count).toBe(1);

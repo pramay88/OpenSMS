@@ -15,7 +15,9 @@ export const messageStatusEnum = pgEnum("message_status", [
   "QUEUED",
   "ASSIGNED",
   "SENDING",
+  "DELIVERY_PENDING",
   "SENT",
+  "DELIVERED",
   "FAILED",
   "EXPIRED",
 ]);

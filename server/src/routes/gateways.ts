@@ -41,6 +41,7 @@ const heartbeatSchema = z.object({
 
 const resultSchema = z.object({
   success: z.boolean(),
+  deliveryStatus: z.enum(["SUBMITTED", "DELIVERED", "DELIVERY_FAILED", "UNKNOWN"]).optional(),
   errorCode: z.string().optional(),
   errorMessage: z.string().optional(),
 });
@@ -112,6 +113,7 @@ gateways.post("/jobs/:jobId/result", gatewayAuthMiddleware, async (c) => {
     gateway.id,
     jobId,
     parsed.data.success,
+    parsed.data.deliveryStatus,
     parsed.data.errorCode,
     parsed.data.errorMessage
   );
@@ -158,7 +160,16 @@ admin.get("/messages", adminAuthMiddleware, async (c) => {
   const status = c.req.query("status");
   const offsetText = c.req.query("offset");
   const offset = offsetText ? Number(offsetText) : 0;
-  const validStatuses = ["QUEUED", "ASSIGNED", "SENDING", "SENT", "FAILED", "EXPIRED"] as const;
+  const validStatuses = [
+    "QUEUED",
+    "ASSIGNED",
+    "SENDING",
+    "DELIVERY_PENDING",
+    "SENT",
+    "DELIVERED",
+    "FAILED",
+    "EXPIRED",
+  ] as const;
   if (status && !validStatuses.includes(status as (typeof validStatuses)[number])) {
     return c.json(errorResponse(new AppError("VALIDATION_ERROR", "Invalid message status", 400)), 400);
   }
