@@ -11,6 +11,13 @@ import {
   createApiClient,
   createRegistrationToken,
   revokeGateway,
+  getAdminSummary,
+  listAdminGateways,
+  listAdminClients,
+  listAdminMessages,
+  getAdminGateway,
+  getAdminMessage,
+  revokeApiClient,
 } from "../services/gateway-service.js";
 import { gatewayAuthMiddleware } from "../middleware/auth-gateway.js";
 import { adminAuthMiddleware, cronAuthMiddleware } from "../middleware/auth-admin.js";
@@ -129,6 +136,49 @@ admin.post("/registration-tokens", adminAuthMiddleware, async (c) => {
   const db = getDb();
   const { token, expiresAt } = await createRegistrationToken(db);
   return c.json({ token, expiresAt: expiresAt.toISOString() }, 201);
+});
+
+admin.get("/summary", adminAuthMiddleware, async (c) => {
+  return c.json(await getAdminSummary(getDb()));
+});
+
+admin.get("/gateways", adminAuthMiddleware, async (c) => {
+  return c.json({ gateways: await listAdminGateways(getDb()) });
+});
+
+admin.get("/gateways/:id", adminAuthMiddleware, async (c) => {
+  return c.json(await getAdminGateway(getDb(), c.req.param("id")!));
+});
+
+admin.get("/clients", adminAuthMiddleware, async (c) => {
+  return c.json({ clients: await listAdminClients(getDb()) });
+});
+
+admin.get("/messages", adminAuthMiddleware, async (c) => {
+  const status = c.req.query("status");
+  const offsetText = c.req.query("offset");
+  const offset = offsetText ? Number(offsetText) : 0;
+  const validStatuses = ["QUEUED", "ASSIGNED", "SENDING", "SENT", "FAILED", "EXPIRED"] as const;
+  if (status && !validStatuses.includes(status as (typeof validStatuses)[number])) {
+    return c.json(errorResponse(new AppError("VALIDATION_ERROR", "Invalid message status", 400)), 400);
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    return c.json(errorResponse(new AppError("VALIDATION_ERROR", "Invalid message offset", 400)), 400);
+  }
+  return c.json({
+    messages: await listAdminMessages(getDb(), status as (typeof validStatuses)[number] | undefined, offset),
+    limit: 100,
+    offset,
+  });
+});
+
+admin.get("/messages/:id", adminAuthMiddleware, async (c) => {
+  return c.json(await getAdminMessage(getDb(), c.req.param("id")!));
+});
+
+admin.post("/clients/:id/revoke", adminAuthMiddleware, async (c) => {
+  await revokeApiClient(getDb(), c.req.param("id")!);
+  return c.json({ status: "revoked", clientId: c.req.param("id") });
 });
 
 admin.post("/gateways/:id/revoke", adminAuthMiddleware, async (c) => {

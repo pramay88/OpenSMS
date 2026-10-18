@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { eq, and, sql, lte, gt, inArray, isNull, or } from "drizzle-orm";
+import { eq, and, sql, lte, gt, inArray, isNull, or, desc, count } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
   apiClients,
@@ -140,6 +140,174 @@ export async function revokeGateway(db: Database, gatewayId: string): Promise<vo
     .returning();
   if (!gateway) {
     throw new AppError("NOT_FOUND", "Gateway not found", 404);
+  }
+}
+
+export async function getAdminSummary(db: Database) {
+  const [messageCounts, gatewayCounts, recentFailures] = await Promise.all([
+    db
+      .select({ status: messages.status, count: count() })
+      .from(messages)
+      .groupBy(messages.status),
+    db
+      .select({ status: gateways.status, count: count() })
+      .from(gateways)
+      .groupBy(gateways.status),
+    db
+      .select({
+        id: messages.id,
+        status: messages.status,
+        errorCode: messages.errorCode,
+        errorMessage: messages.errorMessage,
+        createdAt: messages.createdAt,
+        failedAt: messages.failedAt,
+      })
+      .from(messages)
+      .where(inArray(messages.status, ["FAILED", "EXPIRED"]))
+      .orderBy(desc(messages.failedAt), desc(messages.createdAt))
+      .limit(10),
+  ]);
+
+  return {
+    messages: Object.fromEntries(messageCounts.map((row) => [row.status, Number(row.count)])),
+    gateways: Object.fromEntries(gatewayCounts.map((row) => [row.status, Number(row.count)])),
+    recentFailures,
+  };
+}
+
+export async function listAdminGateways(db: Database) {
+  return db
+    .select({
+      id: gateways.id,
+      name: gateways.name,
+      status: gateways.status,
+      lastHeartbeatAt: gateways.lastHeartbeatAt,
+      appVersion: gateways.appVersion,
+      capabilities: gateways.capabilities,
+      simInfo: gateways.simInfo,
+      networkInfo: gateways.networkInfo,
+      activeJobCount: gateways.activeJobCount,
+      paused: gateways.paused,
+      createdAt: gateways.createdAt,
+      revokedAt: gateways.revokedAt,
+    })
+    .from(gateways)
+    .orderBy(desc(gateways.lastHeartbeatAt), desc(gateways.createdAt))
+    .limit(100);
+}
+
+export async function getAdminGateway(db: Database, gatewayId: string) {
+  const [gateway] = await db
+    .select({
+      id: gateways.id,
+      name: gateways.name,
+      status: gateways.status,
+      lastHeartbeatAt: gateways.lastHeartbeatAt,
+      appVersion: gateways.appVersion,
+      capabilities: gateways.capabilities,
+      simInfo: gateways.simInfo,
+      networkInfo: gateways.networkInfo,
+      activeJobCount: gateways.activeJobCount,
+      paused: gateways.paused,
+      createdAt: gateways.createdAt,
+      revokedAt: gateways.revokedAt,
+    })
+    .from(gateways)
+    .where(eq(gateways.id, gatewayId))
+    .limit(1);
+  if (!gateway) throw new AppError("NOT_FOUND", "Gateway not found", 404);
+  return gateway;
+}
+
+export async function listAdminClients(db: Database) {
+  return db
+    .select({
+      id: apiClients.id,
+      name: apiClients.name,
+      createdAt: apiClients.createdAt,
+      revokedAt: apiClients.revokedAt,
+    })
+    .from(apiClients)
+    .orderBy(desc(apiClients.createdAt))
+    .limit(100);
+}
+
+export async function listAdminMessages(
+  db: Database,
+  status?: Message["status"],
+  offset = 0
+) {
+  const conditions = status ? eq(messages.status, status) : undefined;
+  return db
+    .select({
+      id: messages.id,
+      clientId: messages.clientId,
+      to: messages.to,
+      status: messages.status,
+      gatewayId: messages.gatewayId,
+      createdAt: messages.createdAt,
+      expiresAt: messages.expiresAt,
+      sentAt: messages.sentAt,
+      failedAt: messages.failedAt,
+      errorCode: messages.errorCode,
+      errorMessage: messages.errorMessage,
+      attemptCount: messages.attemptCount,
+    })
+    .from(messages)
+    .where(conditions)
+    .orderBy(desc(messages.createdAt))
+    .limit(100)
+    .offset(Math.max(0, Math.min(offset, 10_000)));
+}
+
+export async function getAdminMessage(db: Database, messageId: string) {
+  const [message] = await db
+    .select({
+      id: messages.id,
+      clientId: messages.clientId,
+      to: messages.to,
+      status: messages.status,
+      gatewayId: messages.gatewayId,
+      createdAt: messages.createdAt,
+      expiresAt: messages.expiresAt,
+      assignedAt: messages.assignedAt,
+      claimedAt: messages.claimedAt,
+      sentAt: messages.sentAt,
+      failedAt: messages.failedAt,
+      errorCode: messages.errorCode,
+      errorMessage: messages.errorMessage,
+      attemptCount: messages.attemptCount,
+    })
+    .from(messages)
+    .where(eq(messages.id, messageId))
+    .limit(1);
+  if (!message) throw new AppError("NOT_FOUND", "Message not found", 404);
+  const events = await db
+    .select({
+      id: messageEvents.id,
+      fromStatus: messageEvents.fromStatus,
+      toStatus: messageEvents.toStatus,
+      createdAt: messageEvents.createdAt,
+    })
+    .from(messageEvents)
+    .where(eq(messageEvents.messageId, messageId))
+    .orderBy(messageEvents.createdAt);
+  return { message, events };
+}
+
+export async function revokeApiClient(db: Database, clientId: string): Promise<void> {
+  const [client] = await db
+    .update(apiClients)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(apiClients.id, clientId), isNull(apiClients.revokedAt)))
+    .returning({ id: apiClients.id });
+  if (!client) {
+    const [existing] = await db
+      .select({ id: apiClients.id })
+      .from(apiClients)
+      .where(eq(apiClients.id, clientId))
+      .limit(1);
+    if (!existing) throw new AppError("NOT_FOUND", "API client not found", 404);
   }
 }
 

@@ -109,10 +109,16 @@ describe("production security configuration", () => {
       const html = await response.text();
       expect(response.status).toBe(200);
       expect(response.headers.get("content-security-policy")).toMatch(/script-src 'nonce-/);
-      expect(html).toContain("'/api/v1/admin/registration-tokens'");
-      expect(html).toContain("Authorization: 'Bearer ' + value");
-      expect(html).toContain("generate.disabled = true");
-      expect(html).toContain("secret.value = ''");
+      expect(html).toContain("Admin dashboard");
+      expect(html).toContain("const api=async(path,options={})");
+      expect(html).toContain("Authorization:'Bearer '+secret");
+      expect(html).toContain("Invalid admin secret.");
+      expect(html).toContain("/api/v1/admin/summary");
+      expect(html).toContain("/api/v1/admin/gateways");
+      expect(html).toContain("/api/v1/admin/clients");
+      expect(html).toContain("/api/v1/admin/messages");
+      expect(html).toContain("Generate registration token");
+      expect(html).toContain("Log out");
       expect(html).not.toContain("localStorage");
       expect(html).not.toContain("sessionStorage");
       const addresses = await app.fetch(
@@ -143,6 +149,19 @@ describe("production security configuration", () => {
       expect(addresses.status).toBe(404);
     } finally {
       config.nodeEnv = previousNodeEnv;
+    }
+  });
+
+  it("protects local console data endpoints with admin authentication", async () => {
+    for (const path of [
+      "/api/v1/admin/summary",
+      "/api/v1/admin/gateways",
+      "/api/v1/admin/clients",
+      "/api/v1/admin/messages",
+      "/api/v1/admin/messages/00000000-0000-0000-0000-000000000000",
+    ]) {
+      const response = await app.fetch(new Request(`http://localhost${path}`));
+      expect(response.status).toBe(401);
     }
   });
 });
