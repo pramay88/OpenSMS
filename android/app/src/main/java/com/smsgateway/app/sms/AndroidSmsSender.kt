@@ -10,7 +10,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.telephony.SmsManager
+import android.telephony.TelephonyManager
 import androidx.core.content.ContextCompat
 import com.smsgateway.app.util.DiagnosticLog
 import kotlinx.coroutines.Dispatchers
@@ -25,17 +28,30 @@ class AndroidSmsSender(
     private val context: Context,
 ) : SmsSender {
 
-    override suspend fun send(to: String, message: String, subscriptionId: Int?): Result<Unit> {
+    override suspend fun send(
+        to: String,
+        message: String,
+        subscriptionId: Int?,
+        onDelivery: (SmsDeliveryResult) -> Unit,
+    ): Result<Unit> {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS)
             != PackageManager.PERMISSION_GRANTED
         ) {
             return Result.failure(SmsException("SMS permission not granted", "PERMISSION_DENIED"))
         }
+        val normalizedTo = to.trim().replace(" ", "")
+        if (normalizedTo.isBlank() || !android.telephony.PhoneNumberUtils.isGlobalPhoneNumber(normalizedTo)) {
+            return Result.failure(SmsException("Recipient must be a valid international phone number", "INVALID_RECIPIENT"))
+        }
+        val telephony = context.getSystemService(TelephonyManager::class.java)
+        if (telephony?.simState != TelephonyManager.SIM_STATE_READY) {
+            return Result.failure(SmsException("No ready SIM is available", "SIM_NOT_READY"))
+        }
 
         return try {
             withContext(Dispatchers.Main) {
                 withTimeout(45000) { // 45 second timeout for Android SMS stack
-                    executeSend(to, message, subscriptionId)
+                    executeSend(normalizedTo, message, subscriptionId, onDelivery)
                 }
             }
         } catch (_: TimeoutCancellationException) {
@@ -50,53 +66,85 @@ class AndroidSmsSender(
         }
     }
 
-    private suspend fun executeSend(to: String, message: String, subscriptionId: Int?): Result<Unit> =
+    private suspend fun executeSend(
+        to: String,
+        message: String,
+        subscriptionId: Int?,
+        onDelivery: (SmsDeliveryResult) -> Unit,
+    ): Result<Unit> =
         suspendCancellableCoroutine { continuation ->
             val smsManager = getSmsManager(subscriptionId)
             val parts = smsManager.divideMessage(message)
             val requestId = UUID.randomUUID().toString()
             val sentAction = "com.smsgateway.app.SMS_SENT_$requestId"
+            val deliveryAction = "com.smsgateway.app.SMS_DELIVERED_$requestId"
 
             val receiver = object : BroadcastReceiver() {
-                private var partsResponded = 0
-                private var alreadyResponded = false
+                private var sentParts = 0
+                private var deliveryParts = 0
+                private var sentReported = false
+                private var deliveryReported = false
 
                 override fun onReceive(context: Context, intent: Intent) {
-                    if (alreadyResponded) return
-
                     val resultCode = resultCode
-                    if (resultCode != Activity.RESULT_OK) {
-                        alreadyResponded = true
-                        val errorCode = mapResultCodeToErrorCode(resultCode)
-                        DiagnosticLog.log("SMS failed for ${redactPhone(to)}: $errorCode ($resultCode)")
-                        if (continuation.isActive) {
-                            continuation.resume(Result.failure(SmsException("Android reported error: $errorCode", errorCode)))
+                    val action = intent.action
+                    if (action == sentAction) {
+                        if (resultCode != Activity.RESULT_OK) {
+                            if (sentReported) return
+                            sentReported = true
+                            val errorCode = mapResultCodeToErrorCode(resultCode)
+                            DiagnosticLog.log("SMS submission failed for ${redactPhone(to)}: $errorCode ($resultCode)")
+                            if (continuation.isActive) {
+                                continuation.resume(
+                                    Result.failure(SmsException("Android reported error: $errorCode", errorCode))
+                                )
+                            }
+                            cleanup()
+                            return
                         }
-                        try {
-                            context.unregisterReceiver(this)
-                        } catch (e: Exception) {
-                            // Already unregistered or context invalid
+                        sentParts++
+                        if (sentParts == parts.size && !sentReported) {
+                            sentReported = true
+                            DiagnosticLog.log("SMS submission accepted for ${redactPhone(to)} (${parts.size} parts)")
+                            if (continuation.isActive) continuation.resume(Result.success(Unit))
                         }
-                        return
+                    } else if (action == deliveryAction) {
+                        if (resultCode != Activity.RESULT_OK) {
+                            if (deliveryReported) return
+                            deliveryReported = true
+                            val errorCode = mapResultCodeToErrorCode(resultCode)
+                            onDelivery(
+                                SmsDeliveryResult(
+                                    SmsDeliveryStatus.FAILED,
+                                    errorCode,
+                                    "Carrier delivery failed: $errorCode",
+                                )
+                            )
+                            cleanup()
+                            return
+                        }
+                        deliveryParts++
+                        if (deliveryParts == parts.size && !deliveryReported) {
+                            deliveryReported = true
+                            onDelivery(SmsDeliveryResult(SmsDeliveryStatus.DELIVERED))
+                            cleanup()
+                        }
                     }
+                }
 
-                    partsResponded++
-                    if (partsResponded == parts.size) {
-                        alreadyResponded = true
-                        DiagnosticLog.log("SMS sent successfully to ${redactPhone(to)} (${parts.size} parts)")
-                        if (continuation.isActive) {
-                            continuation.resume(Result.success(Unit))
-                        }
-                        try {
-                            context.unregisterReceiver(this)
-                        } catch (e: Exception) {
-                            // Already unregistered or context invalid
-                        }
+                private fun cleanup() {
+                    try {
+                        context.unregisterReceiver(this)
+                    } catch (_: Exception) {
+                        // Receiver may already be unregistered after cancellation.
                     }
                 }
             }
 
-            val filter = IntentFilter(sentAction)
+            val filter = IntentFilter().apply {
+                addAction(sentAction)
+                addAction(deliveryAction)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
             } else {
@@ -122,12 +170,29 @@ class AndroidSmsSender(
                         PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                     )
                 })
+                val deliveryIntents = ArrayList((0 until parts.size).map { index ->
+                    val intent = Intent(deliveryAction)
+                    PendingIntent.getBroadcast(
+                        context,
+                        parts.size + index,
+                        intent,
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                    )
+                })
 
                 if (parts.size == 1) {
-                    smsManager.sendTextMessage(to, null, parts[0], sentIntents[0], null)
+                    smsManager.sendTextMessage(to, null, parts[0], sentIntents[0], deliveryIntents[0])
                 } else {
-                    smsManager.sendMultipartTextMessage(to, null, parts, sentIntents, null)
+                    smsManager.sendMultipartTextMessage(to, null, parts, sentIntents, deliveryIntents)
                 }
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try {
+                        context.unregisterReceiver(receiver)
+                        DiagnosticLog.log("No delivery receipt received for ${redactPhone(to)}")
+                    } catch (_: Exception) {
+                        // Already unregistered after a delivery callback.
+                    }
+                }, DELIVERY_RECEIPT_TIMEOUT_MS)
             } catch (e: Exception) {
                 if (continuation.isActive) {
                     continuation.resume(Result.failure(SmsException(e.message ?: "Failed to trigger SMS", "TRIGGER_FAILED", e)))
@@ -158,6 +223,10 @@ class AndroidSmsSender(
             16 -> "SHORT_CODE_NEVER_ALLOWED"
             else -> "ERROR_$resultCode"
         }
+    }
+
+    private companion object {
+        const val DELIVERY_RECEIPT_TIMEOUT_MS = 10 * 60 * 1000L
     }
 
     @Suppress("DEPRECATION")

@@ -31,6 +31,26 @@ android {
         }
     }
 
+    val releaseStoreFile = System.getenv("OPENSMS_RELEASE_STORE_FILE")
+    val releaseStorePassword = System.getenv("OPENSMS_RELEASE_STORE_PASSWORD")
+    val releaseKeyAlias = System.getenv("OPENSMS_RELEASE_KEY_ALIAS")
+    val releaseKeyPassword = System.getenv("OPENSMS_RELEASE_KEY_PASSWORD")
+    val hasReleaseSigning = listOf(
+        releaseStoreFile,
+        releaseStorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword,
+    ).all { !it.isNullOrBlank() }
+
+    if (hasReleaseSigning) {
+        signingConfigs.create("opensmsRelease") {
+            storeFile = file(releaseStoreFile!!)
+            storePassword = releaseStorePassword
+            keyAlias = releaseKeyAlias
+            keyPassword = releaseKeyPassword
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -40,10 +60,15 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("opensmsRelease")
+            }
         }
         debug {
             isMinifyEnabled = false
         }
+
+// gradle.taskGraph.whenReady check removed for testing
     }
 
     compileOptions {

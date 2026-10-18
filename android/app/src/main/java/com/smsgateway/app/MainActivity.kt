@@ -25,14 +25,16 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        val permissions = mutableListOf(
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.READ_PHONE_STATE
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        if (!BuildConfig.USE_FAKE_SMS) {
+            val permissions = mutableListOf(
+                Manifest.permission.SEND_SMS,
+                Manifest.permission.READ_PHONE_STATE,
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            permissionLauncher.launch(permissions.toTypedArray())
         }
-        permissionLauncher.launch(permissions.toTypedArray())
 
         setContent {
             SmsGatewayTheme {

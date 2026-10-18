@@ -47,6 +47,7 @@ data class GatewayUiState(
     val availableSims: List<com.smsgateway.app.device.SimInfo> = emptyList(),
     val hasSmsPermission: Boolean = false,
     val hasPhoneStatePermission: Boolean = false,
+    val senderMode: String = if (BuildConfig.USE_FAKE_SMS) "Fake SMS (devDebug)" else "Real SMS (prod)",
 )
 
 @HiltViewModel
@@ -84,8 +85,10 @@ class GatewayViewModel @Inject constructor(
         val creds = credentialStore.get()
         val sim = simManager.getSimStatus()
 
-        val smsPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
-        val phonePermission = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
+        val smsPermission = BuildConfig.USE_FAKE_SMS ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
+        val phonePermission = BuildConfig.USE_FAKE_SMS ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
 
         _uiState.update {
             it.copy(
@@ -151,7 +154,7 @@ class GatewayViewModel @Inject constructor(
 
     fun sendTestSms(to: String, message: String) {
         viewModelScope.launch {
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS)
+            if (!BuildConfig.USE_FAKE_SMS && ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 _uiState.update { it.copy(testSmsResult = "SMS permission required") }

@@ -23,74 +23,101 @@ interface CredentialStore {
     var selectedSubscriptionId: Int?
 }
 
-class KeystoreCredentialStore(context: Context) : CredentialStore {
-    private val prefs: SharedPreferences
+interface CredentialStorage {
+    fun putString(key: String, value: String?)
+    fun getString(key: String): String?
+    fun putInt(key: String, value: Int?)
+    fun getInt(key: String): Int?
+    fun putBoolean(key: String, value: Boolean)
+    fun getBoolean(key: String, defaultValue: Boolean): Boolean
+    fun clear()
+}
+
+private class SharedPreferencesCredentialStorage(
+    private val prefs: SharedPreferences,
+) : CredentialStorage {
+    override fun putString(key: String, value: String?) {
+        prefs.edit().apply {
+            if (value == null) remove(key) else putString(key, value)
+        }.apply()
+    }
+
+    override fun getString(key: String): String? = prefs.getString(key, null)
+
+    override fun putInt(key: String, value: Int?) {
+        prefs.edit().apply {
+            if (value == null) remove(key) else putInt(key, value)
+        }.apply()
+    }
+
+    override fun getInt(key: String): Int? =
+        if (prefs.contains(key)) prefs.getInt(key, -1).takeIf { it >= 0 } else null
+
+    override fun putBoolean(key: String, value: Boolean) {
+        prefs.edit().putBoolean(key, value).apply()
+    }
+
+    override fun getBoolean(key: String, defaultValue: Boolean): Boolean =
+        prefs.getBoolean(key, defaultValue)
+
+    override fun clear() {
+        prefs.edit().clear().apply()
+    }
+}
+
+class KeystoreCredentialStore(
+    context: Context,
+    storage: CredentialStorage? = null,
+) : CredentialStore {
+    private val storage: CredentialStorage
 
     init {
-        val masterKey = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        prefs = EncryptedSharedPreferences.create(
-            context,
-            PREFS_NAME,
-            masterKey,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
-        )
+        this.storage = storage ?: run {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            SharedPreferencesCredentialStorage(
+                EncryptedSharedPreferences.create(
+                    context,
+                    PREFS_NAME,
+                    masterKey,
+                    EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                    EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+                ),
+            )
+        }
     }
 
     override fun save(credentials: GatewayCredentials) {
-        prefs.edit()
-            .putString(KEY_SERVER_URL, credentials.serverUrl)
-            .putString(KEY_GATEWAY_ID, credentials.gatewayId)
-            .putString(KEY_SECRET, credentials.secret)
-            .putString(KEY_GATEWAY_NAME, credentials.gatewayName)
-            .apply {
-                if (credentials.subscriptionId != null) {
-                    putInt(KEY_SUBSCRIPTION_ID, credentials.subscriptionId)
-                } else {
-                    remove(KEY_SUBSCRIPTION_ID)
-                }
-            }
-            .apply()
+        storage.putString(KEY_SERVER_URL, credentials.serverUrl)
+        storage.putString(KEY_GATEWAY_ID, credentials.gatewayId)
+        storage.putString(KEY_SECRET, credentials.secret)
+        storage.putString(KEY_GATEWAY_NAME, credentials.gatewayName)
+        storage.putInt(KEY_SUBSCRIPTION_ID, credentials.subscriptionId)
     }
 
     override fun get(): GatewayCredentials? {
-        val serverUrl = prefs.getString(KEY_SERVER_URL, null) ?: return null
-        val gatewayId = prefs.getString(KEY_GATEWAY_ID, null) ?: return null
-        val secret = prefs.getString(KEY_SECRET, null) ?: return null
-        val name = prefs.getString(KEY_GATEWAY_NAME, null) ?: return null
-        val subId = if (prefs.contains(KEY_SUBSCRIPTION_ID)) {
-            prefs.getInt(KEY_SUBSCRIPTION_ID, -1).takeIf { it >= 0 }
-        } else {
-            null
-        }
+        val serverUrl = storage.getString(KEY_SERVER_URL) ?: return null
+        val gatewayId = storage.getString(KEY_GATEWAY_ID) ?: return null
+        val secret = storage.getString(KEY_SECRET) ?: return null
+        val name = storage.getString(KEY_GATEWAY_NAME) ?: return null
+        val subId = storage.getInt(KEY_SUBSCRIPTION_ID)
         return GatewayCredentials(serverUrl, gatewayId, secret, name, subId)
     }
 
     override fun clear() {
-        prefs.edit().clear().apply()
+        storage.clear()
     }
 
     override fun isRegistered(): Boolean = get() != null
 
     override var isPaused: Boolean
-        get() = prefs.getBoolean(KEY_PAUSED, false)
-        set(value) {
-            prefs.edit().putBoolean(KEY_PAUSED, value).apply()
-        }
+        get() = storage.getBoolean(KEY_PAUSED, false)
+        set(value) = storage.putBoolean(KEY_PAUSED, value)
 
     override var selectedSubscriptionId: Int?
-        get() = if (prefs.contains(KEY_SUBSCRIPTION_ID)) {
-            prefs.getInt(KEY_SUBSCRIPTION_ID, -1).takeIf { it >= 0 }
-        } else {
-            null
-        }
-        set(value) {
-            prefs.edit().apply {
-                if (value != null) putInt(KEY_SUBSCRIPTION_ID, value) else remove(KEY_SUBSCRIPTION_ID)
-            }.apply()
-        }
+        get() = storage.getInt(KEY_SUBSCRIPTION_ID)
+        set(value) = storage.putInt(KEY_SUBSCRIPTION_ID, value)
 
     companion object {
         private const val PREFS_NAME = "gateway_credentials"

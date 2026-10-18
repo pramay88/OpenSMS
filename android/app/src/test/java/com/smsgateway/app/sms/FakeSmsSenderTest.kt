@@ -31,4 +31,15 @@ class FakeSmsSenderTest {
         assertTrue(result.isFailure)
         assertEquals(0, sender.sentMessages.size)
     }
+
+    @Test
+    fun send_canSimulateDeliveryCallback() = runTest {
+        sender.deliverImmediately = true
+        var callback: SmsDeliveryResult? = null
+
+        val result = sender.send("+12025550100", "Hello", null) { callback = it }
+
+        assertTrue(result.isSuccess)
+        assertEquals(SmsDeliveryStatus.DELIVERED, callback?.status)
+    }
 }

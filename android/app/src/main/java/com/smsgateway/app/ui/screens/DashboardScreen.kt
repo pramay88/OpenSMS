@@ -116,12 +116,13 @@ fun DashboardScreen(
             StatusCard("SIM", uiState.simDescription)
             StatusCard("Network", uiState.networkDescription)
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                StatusCard("Sent", uiState.sentCount.toString(), modifier = Modifier.weight(1f))
+                StatusCard("Submitted", uiState.sentCount.toString(), modifier = Modifier.weight(1f))
                 StatusCard("Failed", uiState.failedCount.toString(), modifier = Modifier.weight(1f))
             }
             StatusCard("Current Job", uiState.currentJobId ?: "None")
             StatusCard("Last Error", uiState.lastError ?: "None")
             StatusCard("App Version", uiState.appVersion)
+            StatusCard("SMS Sender", uiState.senderMode)
 
             Spacer(modifier = Modifier.height(8.dp))
             Button(onClick = onNavigateTestSms, modifier = Modifier.fillMaxWidth()) {

@@ -9,13 +9,18 @@ import com.smsgateway.app.data.local.CredentialStore
 import com.smsgateway.app.data.local.GatewayCredentials
 import com.smsgateway.app.data.local.JobRepository
 import com.smsgateway.app.sms.SmsException
+import com.smsgateway.app.sms.SmsDeliveryResult
+import com.smsgateway.app.sms.SmsDeliveryStatus
 import com.smsgateway.app.sms.SmsSender
 import com.smsgateway.app.util.DiagnosticLog
 import com.smsgateway.app.util.JobValidator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import retrofit2.HttpException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.time.Instant
 
 data class GatewayStats(
@@ -32,6 +37,7 @@ class JobProcessor(
     private val jobRepository: JobRepository,
     private val smsSender: SmsSender,
 ) {
+    private val callbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _stats = MutableStateFlow(GatewayStats())
     val stats: StateFlow<GatewayStats> = _stats.asStateFlow()
 
@@ -48,6 +54,7 @@ class JobProcessor(
                     job.jobId,
                     JobResultRequest(
                         success = job.success,
+                        deliveryStatus = job.deliveryStatus ?: if (job.success) "SUBMITTED" else "DELIVERY_FAILED",
                         errorCode = job.errorCode,
                         errorMessage = job.errorMessage,
                     ),
@@ -70,7 +77,7 @@ class JobProcessor(
         val existing = jobRepository.getJob(job.id)
         if (existing != null && existing.success) {
             DiagnosticLog.log("Skipping duplicate job ${job.id} (already sent locally)")
-            reportSuccess(job)
+            reportSubmission(job)
             return
         }
 
@@ -79,20 +86,36 @@ class JobProcessor(
         _stats.value = _stats.value.copy(currentJobId = job.id)
 
         try {
-            api.ackJob(authHeader(creds), job.id)
+            val acknowledged = api.ackJob(authHeader(creds), job.id)
+            if (acknowledged.status != "SENDING") {
+                DiagnosticLog.log("Ack returned unexpected status for ${job.id}: ${acknowledged.status}")
+                _stats.value = _stats.value.copy(currentJobId = null)
+                return
+            }
         } catch (e: Exception) {
             DiagnosticLog.log("Ack failed for ${job.id}: ${e.message}")
-            if (e is HttpException && e.code() == 404) return
+            _stats.value = _stats.value.copy(currentJobId = null, lastError = "Job acknowledgement failed")
+            return
         }
 
         val hash = JobValidator.bodyHash(job.message)
         jobRepository.savePendingResult(job.id, job.to, hash, success = false)
 
-        val result = smsSender.send(job.to, job.message, subscriptionId)
+        val result = smsSender.send(job.to, job.message, subscriptionId) { delivery ->
+            callbackScope.launch {
+                reportDelivery(job, delivery)
+            }
+        }
         result.fold(
             onSuccess = {
-                jobRepository.savePendingResult(job.id, job.to, hash, success = true)
-                reportSuccess(job)
+                jobRepository.savePendingResult(
+                    job.id,
+                    job.to,
+                    hash,
+                    success = true,
+                    deliveryStatus = "SUBMITTED",
+                )
+                reportSubmission(job)
                 _stats.value = _stats.value.copy(
                     sentCount = _stats.value.sentCount + 1,
                     currentJobId = null,
@@ -113,17 +136,52 @@ class JobProcessor(
         )
     }
 
-    private suspend fun reportSuccess(job: JobDto) {
+    private suspend fun reportSubmission(job: JobDto) {
         val creds = credentialStore.get() ?: return
         try {
             apiProvider().reportResult(
                 authHeader(creds),
                 job.id,
-                JobResultRequest(success = true),
+                JobResultRequest(success = true, deliveryStatus = "SUBMITTED"),
             )
             jobRepository.markReported(job.id)
         } catch (e: Exception) {
             DiagnosticLog.log("Report success failed for ${job.id}: ${e.message}")
+        }
+
+    }
+
+    private suspend fun reportDelivery(job: JobDto, delivery: SmsDeliveryResult) {
+        val creds = credentialStore.get() ?: return
+        val success = delivery.status != SmsDeliveryStatus.FAILED
+        val deliveryStatus = when (delivery.status) {
+            SmsDeliveryStatus.DELIVERED -> "DELIVERED"
+            SmsDeliveryStatus.FAILED -> "DELIVERY_FAILED"
+            SmsDeliveryStatus.UNKNOWN -> "UNKNOWN"
+        }
+        jobRepository.savePendingResult(
+            job.id,
+            job.to,
+            JobValidator.bodyHash(job.message),
+            success = success,
+            errorCode = delivery.errorCode,
+            errorMessage = delivery.errorMessage,
+            deliveryStatus = deliveryStatus,
+        )
+        try {
+            apiProvider().reportResult(
+                authHeader(creds),
+                job.id,
+                JobResultRequest(
+                    success = success,
+                    deliveryStatus = deliveryStatus,
+                    errorCode = delivery.errorCode,
+                    errorMessage = delivery.errorMessage,
+                ),
+            )
+            DiagnosticLog.log("Delivery callback reported for ${job.id}: ${delivery.status}")
+        } catch (e: Exception) {
+            DiagnosticLog.log("Delivery callback report failed for ${job.id}: ${e.message}")
         }
     }
 

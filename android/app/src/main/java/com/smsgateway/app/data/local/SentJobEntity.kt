@@ -18,6 +18,7 @@ data class SentJobEntity(
     val errorMessage: String?,
     val reported: Boolean,
     val createdAt: Long,
+    val deliveryStatus: String? = null,
 )
 
 @Dao

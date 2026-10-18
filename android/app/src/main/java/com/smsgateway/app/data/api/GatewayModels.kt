@@ -35,6 +35,7 @@ data class JobsResponse(
 
 data class JobResultRequest(
     val success: Boolean,
+    val deliveryStatus: String? = null,
     val errorCode: String? = null,
     val errorMessage: String? = null,
 )

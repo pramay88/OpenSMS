@@ -26,7 +26,7 @@ sequenceDiagram
     end
 
     Client->>Server: GET /messages/:id
-    Server-->>Client: status SENT
+    Server-->>Client: status DELIVERY_PENDING or DELIVERED
 ```
 
 ## Message Lifecycle
@@ -36,7 +36,9 @@ stateDiagram-v2
     [*] --> QUEUED: POST /messages
     QUEUED --> ASSIGNED: gateway poll claims
     ASSIGNED --> SENDING: Android ack
-    SENDING --> SENT: result success
+    SENDING --> DELIVERY_PENDING: Android submission accepted
+    DELIVERY_PENDING --> DELIVERED: delivery receipt
+    DELIVERY_PENDING --> FAILED: delivery failure
     SENDING --> FAILED: result failure
     QUEUED --> EXPIRED: maintenance cron
     ASSIGNED --> EXPIRED: maintenance cron

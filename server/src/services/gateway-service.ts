@@ -560,7 +560,7 @@ export async function pollJobs(db: Database, gatewayId: string): Promise<Message
       .where(
         and(
           eq(messages.gatewayId, gatewayId),
-          inArray(messages.status, ["ASSIGNED", "SENDING"]),
+          eq(messages.status, "ASSIGNED"),
           sql`${messages.expiresAt} > ${now}`
         )
       )
@@ -686,13 +686,12 @@ export async function reportJobResult(
   gatewayId: string,
   jobId: string,
   success: boolean,
-  deliveryStatus: "SUBMITTED" | "DELIVERED" | "DELIVERY_FAILED" | "UNKNOWN" = success
-    ? "SUBMITTED"
-    : "DELIVERY_FAILED",
+  deliveryStatus?: "SUBMITTED" | "DELIVERED" | "DELIVERY_FAILED" | "UNKNOWN",
   errorCode?: string,
   errorMessage?: string
 ): Promise<Message> {
   return db.transaction(async (tx) => {
+    const effectiveDeliveryStatus = deliveryStatus ?? (success ? "SUBMITTED" : "DELIVERY_FAILED");
     const [existing] = await tx
       .select()
       .from(messages)
@@ -707,6 +706,9 @@ export async function reportJobResult(
     if (existing.status === "FAILED" && !success) return existing;
     if (existing.status === "DELIVERY_PENDING" && success && deliveryStatus !== "DELIVERED") {
       return existing;
+    }
+    if (existing.status === "DELIVERY_PENDING" && !success && deliveryStatus === undefined) {
+      throw new AppError("INVALID_STATE", "Submission result conflicts with pending delivery", 409);
     }
     if (["DELIVERED", "FAILED", "EXPIRED"].includes(existing.status)) {
       throw new AppError("INVALID_STATE", `Job is already in terminal state: ${existing.status}`, 409);
@@ -725,7 +727,7 @@ export async function reportJobResult(
     const fromStatus = existing.status;
     const nextStatus = !success
       ? "FAILED"
-      : deliveryStatus === "DELIVERED"
+      : effectiveDeliveryStatus === "DELIVERED"
         ? "DELIVERED"
         : isSubmission
           ? "DELIVERY_PENDING"
@@ -749,7 +751,7 @@ export async function reportJobResult(
               errorCode: null,
               errorMessage: null,
             }
-          : deliveryStatus === "DELIVERED"
+          : effectiveDeliveryStatus === "DELIVERED"
           ? {
               status: "DELIVERED",
               claimExpiresAt: null,
@@ -767,7 +769,7 @@ export async function reportJobResult(
         and(
           eq(messages.id, jobId),
           eq(messages.gatewayId, gatewayId),
-          eq(messages.status, "SENDING")
+          eq(messages.status, existing.status)
         )
       )
       .returning();

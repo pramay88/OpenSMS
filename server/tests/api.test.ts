@@ -649,7 +649,7 @@ describe("Job delivery flow", () => {
       "SELECT messages.status, gateways.active_job_count FROM messages JOIN gateways ON gateways.id = messages.gateway_id WHERE messages.id = $1",
       [job.id]
     );
-    expect(["SENT", "FAILED"]).toContain(counts.rows[0].status);
+    expect(["DELIVERY_PENDING", "SENT", "FAILED"]).toContain(counts.rows[0].status);
     expect(counts.rows[0].active_job_count).toBe(0);
   });
 

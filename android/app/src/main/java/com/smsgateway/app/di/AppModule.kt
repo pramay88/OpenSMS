@@ -17,6 +17,7 @@ import com.smsgateway.app.domain.JobProcessor
 import com.smsgateway.app.sms.AndroidSmsSender
 import com.smsgateway.app.sms.FakeSmsSender
 import com.smsgateway.app.sms.SmsSender
+import com.smsgateway.app.util.DiagnosticLog
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -109,8 +110,10 @@ object AppModule {
     @Singleton
     fun provideSmsSender(@ApplicationContext context: Context): SmsSender {
         return if (BuildConfig.USE_FAKE_SMS) {
+            DiagnosticLog.log("SMS sender: FakeSmsSender (${BuildConfig.BUILD_TYPE})")
             FakeSmsSender()
         } else {
+            DiagnosticLog.log("SMS sender: AndroidSmsSender (${BuildConfig.BUILD_TYPE})")
             AndroidSmsSender(context)
         }
     }

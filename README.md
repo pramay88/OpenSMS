@@ -86,6 +86,15 @@ curl -X POST http://localhost:3000/api/v1/messages \
   -d '{"to":"+1234567890","message":"Hello"}'
 ```
 
+### Local operator dashboard
+
+When running with `NODE_ENV=development`, open
+`http://localhost:3000/_dev/setup` for the local setup dashboard. It checks
+backend/database health, helps identify a phone-facing LAN URL, generates
+single-use Android registration tokens, and can load authenticated read-only
+gateway, client, message, and status summaries. The dashboard is unavailable
+outside development and never stores the admin secret in browser storage.
+
 ## API Usage
 
 ```http
@@ -148,7 +157,7 @@ See [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Limitations
 
-- Delivery status `SENT` means accepted by Android SMS API, not carrier delivery receipt
+- `DELIVERY_PENDING` means Android accepted the SMS submission but no carrier delivery receipt has arrived; only `DELIVERED` confirms a receipt
 - Requires an Android phone with active SIM and SMS plan
 - Vercel deployment requires external PostgreSQL (Neon, Supabase, etc.)
 - Rate limits and carrier restrictions apply

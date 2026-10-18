@@ -9,6 +9,7 @@ interface JobRepository {
         success: Boolean,
         errorCode: String? = null,
         errorMessage: String? = null,
+        deliveryStatus: String? = null,
     )
 
     suspend fun getUnreportedJobs(): List<SentJobEntity>
@@ -27,6 +28,7 @@ class RoomJobRepository(
         success: Boolean,
         errorCode: String?,
         errorMessage: String?,
+        deliveryStatus: String?,
     ) {
         dao.upsert(
             SentJobEntity(
@@ -38,6 +40,7 @@ class RoomJobRepository(
                 errorMessage = errorMessage,
                 reported = false,
                 createdAt = System.currentTimeMillis(),
+                deliveryStatus = deliveryStatus,
             ),
         )
     }

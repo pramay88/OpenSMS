@@ -8,6 +8,7 @@ import com.smsgateway.app.data.api.JobResultResponse
 import com.smsgateway.app.data.local.CredentialStore
 import com.smsgateway.app.data.local.GatewayCredentials
 import com.smsgateway.app.data.local.JobRepository
+import com.smsgateway.app.data.local.SentJobEntity
 import com.smsgateway.app.sms.FakeSmsSender
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -58,7 +59,9 @@ class JobProcessorTest {
             status = "ASSIGNED",
         )
         processor.processJob(job, null)
-        coVerify { api.reportResult(any(), "j1", JobResultRequest(success = true)) }
+        coVerify {
+            api.reportResult(any(), "j1", JobResultRequest(success = true, deliveryStatus = "SUBMITTED"))
+        }
         assert(smsSender.sentMessages.size == 1)
     }
 
@@ -94,5 +97,119 @@ class JobProcessorTest {
                 match { !it.success && it.errorCode == "FAKE_FAILURE" },
             )
         }
+    }
+
+    @Test
+    fun processJob_doesNotSendWhenAcknowledgementFails() = runTest {
+        coEvery { api.ackJob(any(), "j-ack-fail") } throws RuntimeException("server unavailable")
+
+        processor.processJob(
+            JobDto(
+                id = "j-ack-fail",
+                to = "+12025550100",
+                message = "Do not send",
+                expiresAt = Instant.now().plusSeconds(300).toString(),
+                status = "ASSIGNED",
+            ),
+            null,
+        )
+
+        assert(smsSender.sentMessages.isEmpty())
+        coVerify(exactly = 0) {
+            api.reportResult(any(), "j-ack-fail", any())
+        }
+    }
+
+    @Test
+    fun processJob_doesNotSendAgainWhenLocalSuccessWasRecorded() = runTest {
+        coEvery { jobRepository.getJob("j4") } returns SentJobEntity(
+            jobId = "j4",
+            toNumber = "+12025550100",
+            bodyHash = "hash",
+            success = true,
+            errorCode = null,
+            errorMessage = null,
+            reported = false,
+            createdAt = 1L,
+        )
+
+        processor.processJob(
+            JobDto(
+                id = "j4",
+                to = "+12025550100",
+                message = "Already sent",
+                expiresAt = Instant.now().plusSeconds(300).toString(),
+                status = "ASSIGNED",
+            ),
+            null,
+        )
+
+        coVerify(exactly = 0) { api.ackJob(any(), any()) }
+        assert(smsSender.sentMessages.isEmpty())
+        coVerify {
+            api.reportResult(any(), "j4", JobResultRequest(success = true, deliveryStatus = "SUBMITTED"))
+        }
+    }
+
+    @Test
+    fun processJob_keepsResultPendingWhenReportingFails() = runTest {
+        coEvery { api.reportResult(any(), any(), any()) } throws RuntimeException("network unavailable")
+
+        processor.processJob(
+            JobDto(
+                id = "j5",
+                to = "+12025550100",
+                message = "Report later",
+                expiresAt = Instant.now().plusSeconds(300).toString(),
+                status = "ASSIGNED",
+            ),
+            null,
+        )
+
+        coVerify {
+            jobRepository.savePendingResult(
+                "j5",
+                "+12025550100",
+                any(),
+                true,
+                null,
+                null,
+                "SUBMITTED",
+            )
+        }
+        coVerify(exactly = 0) { jobRepository.markReported("j5") }
+        assert(smsSender.sentMessages.size == 1)
+    }
+
+    @Test
+    fun replayUnreportedResults_reportsAndMarksEachPendingResult() = runTest {
+        coEvery { jobRepository.getUnreportedJobs() } returns listOf(
+            SentJobEntity(
+                jobId = "j6",
+                toNumber = "+12025550100",
+                bodyHash = "hash",
+                success = false,
+                errorCode = "SEND_FAILED",
+                errorMessage = "carrier rejected",
+                reported = false,
+                createdAt = 1L,
+            ),
+        )
+
+        processor.replayUnreportedResults()
+
+        coVerify {
+            api.reportResult(
+                any(),
+                "j6",
+                JobResultRequest(
+                    success = false,
+                    deliveryStatus = "DELIVERY_FAILED",
+                    errorCode = "SEND_FAILED",
+                    errorMessage = "carrier rejected",
+                ),
+            )
+        }
+        coVerify { jobRepository.markReported("j6") }
     }
 }

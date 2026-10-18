@@ -21,8 +21,10 @@ class CredentialStoreTest {
 
     @Before
     fun setup() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        store = KeystoreCredentialStore(context)
+        store = KeystoreCredentialStore(
+            ApplicationProvider.getApplicationContext<Context>(),
+            InMemoryCredentialStorage(),
+        )
         store.clear()
     }
 
@@ -63,5 +65,32 @@ class CredentialStoreTest {
 
     private fun assertEquals(expected: String, actual: String) {
         org.junit.Assert.assertEquals(expected, actual)
+    }
+
+    private class InMemoryCredentialStorage : CredentialStorage {
+        private val values = mutableMapOf<String, Any?>()
+
+        override fun putString(key: String, value: String?) {
+            if (value == null) values.remove(key) else values[key] = value
+        }
+
+        override fun getString(key: String): String? = values[key] as? String
+
+        override fun putInt(key: String, value: Int?) {
+            if (value == null) values.remove(key) else values[key] = value
+        }
+
+        override fun getInt(key: String): Int? = values[key] as? Int
+
+        override fun putBoolean(key: String, value: Boolean) {
+            values[key] = value
+        }
+
+        override fun getBoolean(key: String, defaultValue: Boolean): Boolean =
+            values[key] as? Boolean ?: defaultValue
+
+        override fun clear() {
+            values.clear()
+        }
     }
 }
