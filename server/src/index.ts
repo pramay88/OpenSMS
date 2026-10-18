@@ -8,6 +8,7 @@ import { errorHandler } from "./middleware/error-handler.js";
 import type { AppEnv } from "./types.js";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
+import { devSetup } from "./routes/dev-setup.js";
 
 export function createApp() {
   const app = new Hono<AppEnv>();
@@ -29,6 +30,7 @@ export function createApp() {
   app.route("/api/v1/gateways", gateways);
   app.route("/api/v1/admin", admin);
   app.route("/api/v1/maintenance", maintenance);
+  app.route("/_dev/setup", devSetup);
 
   app.onError((err, c) => errorHandler(err, c));
 
